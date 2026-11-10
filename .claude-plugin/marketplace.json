@@ -1,6 +1,9 @@
 {
   "name": "agent-foreman",
-  "owner": { "name": "icesword0760" },
+  "description": "Agent Foreman: let Claude Code direct Codex CLI like a foreman.",
+  "owner": {
+    "name": "icesword0760"
+  },
   "plugins": [
     {
       "name": "agent-foreman",
