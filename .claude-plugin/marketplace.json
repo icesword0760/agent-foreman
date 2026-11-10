@@ -1,0 +1,11 @@
+{
+  "name": "agent-foreman",
+  "owner": { "name": "icesword0760" },
+  "plugins": [
+    {
+      "name": "agent-foreman",
+      "source": "./",
+      "description": "Let Claude Code direct Codex CLI (and optionally DSH) like a foreman: write a brief, dispatch, watch live events, answer questions, accept by evidence."
+    }
+  ]
+}

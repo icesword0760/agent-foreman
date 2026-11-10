@@ -1,0 +1,10 @@
+{
+  "name": "agent-foreman",
+  "version": "0.1.0",
+  "description": "Let Claude Code direct Codex CLI (and optionally DSH) like a foreman: write a brief, dispatch, watch live events, answer questions, accept by evidence.",
+  "author": { "name": "icesword0760" },
+  "homepage": "https://github.com/icesword0760/agent-foreman",
+  "repository": "https://github.com/icesword0760/agent-foreman",
+  "license": "MIT",
+  "keywords": ["codex", "supervisor", "multi-agent", "delegation"]
+}
