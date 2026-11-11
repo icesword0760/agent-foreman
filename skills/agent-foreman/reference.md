@@ -21,7 +21,7 @@
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `--agent` | `codex` | `dsh` 把任务派给 DSH CLI（只在 `start` 时指定，之后的 `send` 沿用）。DSH 的 `--model` 可写 `flash`、`pro` 或完整型号，`--effort` 为 `off`/`low`/`high`/`max` |
+| `--agent` | `codex` | `dsh` 把任务派给 DSH CLI，`agy` 派给 Antigravity CLI（只在 `start` 时指定，之后的 `send` 沿用）。DSH 的 `--model` 可写 `flash`、`pro` 或完整型号，`--effort` 为 `off`/`low`/`high`/`max`。Antigravity 的 `--model` 默认 `argon`（Argon 系列最新版，用 `agy models` 解析），也可写完整型号；`--effort` 为 `low`/`medium`/`high`，默认 `high`；找不到 Argon 或额度用完时直接失败，不重试、不换模型 |
 | `--model` / `--effort` | `sol` / `high` | Codex 默认 = 主力 sol 系列里版本最新的可用型号 + 高档推理。系列关键字 `astra`（前沿）、`sol`（主力）、`terra`（均衡）、`luna`（快速）都按「该系列最新版本」解析；`best` = 跨系列最高档（astra > sol > terra > luna，再比版本），不按目录排序。操作电脑界面的部分（computer use，含 Blender 建模）不换主模型，由脚本在运行约定里要求主 Codex 用 `spawn_agent` 派 terra 最新版子代理完成（必须带 `fork_turns="none"`，否则模型设置不生效）。`start` 时解析一次，整个任务沿用；出现不认识的系列会 ⚠ 提醒确认；该系列没有可用型号时直接报错，不自动换系列。`codex debug models` 偶尔返回过时的内置目录，脚本会记住 7 天内见过的型号，不会因此降级。显式写型号名则直接用。模型繁忙时脚本会退避重试，持续失败就报告用户 |
 | `--idle-min` | 10 | 多久没动静判定卡住，结束本轮并重试 |
 | `--warn-min` | 3 | 多久没动静先发 ⏸ 提醒 |
@@ -36,7 +36,7 @@
 | `--no-watch` | 关 | 启动后不跟踪事件流 |
 | `--watch-min` | 29 | 跟踪多久后自动交回（退出码 8，任务继续运行），留在 Monitor 30 分钟上限以内 |
 
-环境变量：`CODEX_BIN`（Codex 可执行文件，默认 PATH 里的 `codex`）、`DSH_BIN`（默认 PATH 里的 `dsh`；找不到时运行约定里不出现 DSH 那一段）、`CODEX_SERVICE_TIER`（默认 `default`，普通速度档）、`FOREMAN_RUN_DIR`。
+环境变量：`CODEX_BIN`（Codex 可执行文件，默认 PATH 里的 `codex`）、`DSH_BIN`（默认 PATH 里的 `dsh`；找不到时运行约定里不出现 DSH 那一段）、`AGY_BIN`（默认 PATH 里的 `agy`）、`CODEX_SERVICE_TIER`（默认 `default`，普通速度档）、`FOREMAN_RUN_DIR`。
 
 ## 事件符号
 
@@ -65,4 +65,5 @@
 - 执行者看不到你看到的图片和界面。审美判断要转成具体数值，并要求它交出截图或样片给你看。
 - 要跑测试的交代书写明解释器的绝对路径（例如 Python），执行者的 PATH 可能和你 shell 里的不一样。
 - 没有 git 的目录也能派活，但审查包没法用 `git diff` 生成：改动前让执行者把要改的文件备份到工作区，验收时用备份做 diff。
+- Antigravity（`--agent agy`）：以 agy 的 result 事件为准，它给出结果后偶尔挂着不退出，10 秒后会被结束。它容易把「当前目录」理解成 `--add-dir` 的目录，运行约定已写明工作目录的绝对路径，交代书里也尽量写绝对路径。额度用完时报「Argon 额度用完」并失败，不会重试；agy 的 `ask_question` 工具在这里没人回答，运行约定已要求它改用 `ask` 命令。
 - DSH 无头模式报 `MISSING_CREDENTIAL`：它的 headless 配置默认关掉了凭据插件，在 `~/.dsh/profiles/headless/` 的用户补丁里把 `credentials` 插件打开。

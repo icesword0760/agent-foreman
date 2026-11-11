@@ -25,6 +25,7 @@ Claude 擅长理解你要什么、做产品取舍、判断结果好不好；Code
 - **防止做偏的交代书模板**：目标、实际场景、开发者意图（用户原话）、项目意图、验收标准各占一栏，每栏必填。Codex 把一部分活交给子代理时，子代理直接读原始交代书，不靠转述；子代理做的决定也要交回，并注明来源。
 - **模型选择**：默认用 Codex 主力 sol 系列的最新型号 + 高档推理，启动时解析。需要操作电脑界面的部分（点按桌面软件、Blender 建模）交给 terra 系列最新型号的子代理，主模型不来回切换。
 - **可选的 DSH 前端 UI 分工**：装了 `dsh` CLI 时，前端 UI 设计和对应的界面代码派给 DSH 子任务（DeepSeek V4.1 Flash，高档推理），Codex 负责整合。
+- **可选的 Antigravity**：装了 `agy` CLI 时，可以用 `--agent agy` 把任务派给 Antigravity（Argon 系列最新型号，高档推理）。不会自动换别的模型：Argon 用不了或额度用完时，任务直接失败并写明原因。
 - **并行**：怎么把互不依赖的活拆到不同 git worktree 或分支、同时跑几个 agent、验收后合并，都有指引。
 - **不怕 Monitor 到期**：监督进程和启动它的命令是分开的。Claude 的 Monitor 30 分钟到期时只停止跟踪，任务照常运行，用 `watch` 重新接上。
 - **状态显示**：在 [码头（Matou）](https://github.com/icesword0760/matou) 终端工作台里，每个任务显示为底栏的一张卡片，写明 agent、任务名、模型和推理档位。在其他终端里，可以用状态行脚本为每个任务显示一行。
@@ -36,6 +37,7 @@ Claude 擅长理解你要什么、做产品取舍、判断结果好不好；Code
 - Node.js 22 或更新
 - macOS：开发和测试都在 macOS 上；其他系统没测过，按网络流量判断活动的功能只支持 macOS
 - 可选：`dsh` CLI，用于前端 UI 子任务
+- 可选：`agy`（Antigravity）CLI，用于派给 Antigravity 的任务
 
 ## 安装
 
@@ -90,7 +92,7 @@ Claude 用到的命令都在 `skills/agent-foreman/scripts/foreman.mjs`：
 node --test skills/agent-foreman/tests/*.test.mjs
 ```
 
-测试使用假的 `codex` 和 `dsh` 可执行文件，不需要联网，也不需要账号。
+测试使用假的 `codex`、`dsh` 和 `agy` 可执行文件，不需要联网，也不需要账号。
 
 ## 许可证
 

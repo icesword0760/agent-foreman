@@ -25,6 +25,7 @@ Calling `codex exec` directly from Claude works until it doesn't: the call block
 - **A brief template that prevents drift.** Goal, real usage scenario, developer intent (the user's own words), project intent, and acceptance criteria are separate required slots. When Codex hands part of the work to a sub-agent, the sub-agent reads the original brief instead of a paraphrase, and its decisions are reported back labeled.
 - **Model selection.** Defaults to the newest model in Codex's main (sol) family at high reasoning, resolved at start. Anything that needs computer use (clicking through desktop apps, Blender modeling) goes to a sub-agent on the newest terra model, so the main model never switches.
 - **Optional DSH for front-end UI.** If the `dsh` CLI is installed, front-end UI design and its interface code go to a DSH sub-task (DeepSeek V4.1 Flash, high reasoning), and Codex integrates the result.
+- **Optional Antigravity.** If the `agy` CLI is installed, a task can be handed to Antigravity with `--agent agy` (newest Argon model, high reasoning). It never falls back to another model: when Argon is unavailable or out of quota, the task fails with the reason.
 - **Parallel work.** Guidance for splitting independent work across git worktrees or branches, running several agents at once, and merging after acceptance.
 - **Survives the Monitor timeout.** The supervisor is detached from the command that started it. When Claude's 30-minute Monitor expires, only the watching stops; the task keeps running and Claude re-attaches with `watch`.
 - **Status display.** In the [Matou](https://github.com/icesword0760/matou) terminal workbench, each task appears as a card in the bottom bar with the agent, task name, model and reasoning level. In other terminals, a status-line script adds one line per task.
@@ -36,6 +37,7 @@ Calling `codex exec` directly from Claude works until it doesn't: the call block
 - Node.js 22 or newer
 - macOS. This is what it is built and tested on. Other systems are untested, and the network-based activity detection is macOS-only.
 - Optional: the `dsh` CLI, for front-end UI sub-tasks
+- Optional: the `agy` (Antigravity) CLI, for tasks you hand to Antigravity
 
 ## Install
 
@@ -90,7 +92,7 @@ The skill's instructions, the brief template, and the events and rules the super
 node --test skills/agent-foreman/tests/*.test.mjs
 ```
 
-The tests use fake `codex` and `dsh` executables; they need no network or account.
+The tests use fake `codex`, `dsh` and `agy` executables; they need no network or account.
 
 ## License
 

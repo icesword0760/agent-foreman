@@ -11,6 +11,9 @@ const SCRIPT = fileURLToPath(import.meta.url);
 const RUNS = path.resolve(process.env.FOREMAN_RUN_DIR || path.join(os.homedir(), '.claude', 'agent-foreman', 'runs'));
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 const DSH_BIN = process.env.DSH_BIN || 'dsh';
+const AGY_BIN = process.env.AGY_BIN || 'agy';
+const AGY_RESULT_EXIT_MS = Number(process.env.FOREMAN_AGY_RESULT_EXIT_MS) || 10_000;
+const AGY_QUOTA = /RESOURCE_EXHAUSTED|quota|Resets in|额度/i;
 
 const DEFAULTS = { askWaitMin: 10, model: 'sol', effort: 'high', idleMin: 10, warnMin: 3, maxMin: 45, retries: 3, backoffMin: [2, 5, 10] };
 const POLL_MS = Number(process.env.FOREMAN_POLL_MS) || 15_000;
@@ -35,7 +38,8 @@ Exit code 7: Codex 正在等回答。
 Exit code 8: 跟踪到期，任务继续运行。
 Options:
   FOREMAN_RUN_DIR overrides ~/.claude/agent-foreman/runs for all commands.
-  --agent codex|dsh (codex; start). DSH_BIN overrides dsh from PATH.
+  --agent codex|dsh|agy (codex; start). DSH_BIN / AGY_BIN override dsh / agy from PATH.
+  agy defaults: --model argon (latest matching effort), --effort low|medium|high (high).
   --ask-wait-min N (10; start/send)
   --no-watch  --watch-min N (29)  --warn-min N (3)
   --model M (sol；系列最新版，可选 best/astra/sol/terra/luna 或型号)  --effort E (high)  --idle-min N (10)  --max-min N (45)
@@ -89,7 +93,7 @@ function parseArgs(argv) {
     if (opts[key] != null && (!Number.isFinite(opts[key]) || opts[key] <= 0)) throw new Error(usage);
   }
   if (opts.retries != null && (!Number.isInteger(opts.retries) || opts.retries < 0)) throw new Error(usage);
-  if (opts.agent != null && !['codex', 'dsh'].includes(opts.agent)) throw new Error('--agent must be codex or dsh');
+  if (opts.agent != null && !['codex', 'dsh', 'agy'].includes(opts.agent)) throw new Error('--agent must be codex, dsh or agy');
   if (opts.backoffMin?.some((n) => !Number.isFinite(n) || n < 0)) throw new Error(usage);
   return { cmd, task, opts };
 }
@@ -103,6 +107,7 @@ const log = (msg) => console.log(`[foreman ${new Date().toLocaleTimeString('zh-C
 
 let publishAgentStatus = false;
 let lastAgentStatus;
+const agentName = (state) => ({ dsh: 'DSH', agy: 'Antigravity' }[state.agent] || 'Codex');
 const networkNote = (state) => state.networkSampling ? '（网络也没有数据）' : '';
 const quietDuration = (ms) => ms < 60_000 ? `${Math.floor(ms / 1000)} 秒` : `${Math.floor(ms / 60_000)} 分钟`;
 
@@ -140,7 +145,7 @@ function writeAgentStatus(state) {
     const effort = state.options.effort;
     const effortName = new Map([['off', '关闭'], ['minimal', '最低档'], ['low', '低档'], ['medium', '中档'], ['high', '高档'], ['xhigh', '超高档'], ['max', '最高档']]).get(effort) ?? effort;
     const model = state.options.model;
-    const label = `${state.agent === 'dsh' ? 'DSH' : 'Codex'}：${state.task}（${model && model !== 'best' ? `${model} · ` : ''}${effortName}推理）`;
+    const label = `${agentName(state)}：${state.task}（${model && model !== 'best' ? `${model} · ` : ''}${effortName}推理）`;
     const file = path.join(dir, `${id}.json`);
     if (lastAgentStatus?.file === file && lastAgentStatus.status === status &&
         lastAgentStatus.label === label && lastAgentStatus.detail === detail && time - lastAgentStatus.time < 1000) return;
@@ -259,6 +264,22 @@ function dshActivity(ev) {
     return `调用工具 ${short(ev.tool, 30)}`;
   }
 }
+function agyActivity(ev) {
+  const step = ev.event === 'step_update' && ev.step_update;
+  if (!step || step.step_type !== 'tool') return;
+  const name = step.tool_name || step.tool_info?.name || '';
+  const params = step.tool_info?.parameters || {};
+  const file = Object.entries(params).find(([key, value]) => /path|file/i.test(key) && typeof value === 'string')?.[1];
+  if (name === 'run_command') {
+    const description = commandDescription(params.CommandLine);
+    if (['提问', '提问（不阻塞）', '查看信箱'].includes(description)) return description;
+    return `${step.state === 'DONE' ? '跑完' : '运行'} ${description}`;
+  }
+  if (['write_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'sed_file', 'notebook_edit'].includes(name)) return `修改 ${path.basename(file || '')}`;
+  if (name === 'view_file') return `读取 ${path.basename(file || '')}`;
+  if (name === 'search_web') return `搜索 ${short(params.query || params.Query, 32)}`;
+  return `调用工具 ${short(name, 30)}`;
+}
 function finalText(state) {
   const task = state.task;
   const last = state.turns.at(-1);
@@ -271,7 +292,7 @@ function finalText(state) {
   if (state.status !== 'stopped' && (state.status === 'completed' || reply.trim())) {
     const chars = Array.from(reply);
     if (chars.length > 6000) reply = chars.slice(0, 6000).join('') + `…（完整内容见 ${last.files.last}）`;
-    text += `\n${clock(state.endedAt)} --- ${state.agent === 'dsh' ? 'DSH' : 'Codex'} 回复 ---\n${reply}`;
+    text += `\n${clock(state.endedAt)} --- ${agentName(state)} 回复 ---\n${reply}`;
   }
   return `${clock(state.endedAt)} ${text}\n`;
 }
@@ -307,7 +328,7 @@ async function watch(task, offset, watchMin = 29) {
     const answered = waiting != null && fs.existsSync(mailPath(task, 'answers', `a-${waiting}`));
     if (waiting != null && !answered) console.log(`${clock()} … ${task} 等待回答 #${waiting}：${state.waitingQuestionText}`);
     else {
-      const detail = answered ? `已回答 #${waiting}，等待 ${state.agent === 'dsh' ? 'DSH' : 'Codex'} 继续` : state.activity || '启动中';
+      const detail = answered ? `已回答 #${waiting}，等待 ${agentName(state)} 继续` : state.activity || '启动中';
       console.log(`${clock()} … ${task} 进行中：${detail}（已运行 ${duration(Date.now() - Date.parse(state.runStartedAt || state.createdAt))}）`);
     }
   }
@@ -365,7 +386,7 @@ function protocolFooter(state) {
 ## 运行约定（由监督脚本附加）
 - 你是执行者，负责把本任务交代的目标落地。创意方向、产品取舍和审美以交代为准；交代没写到、又会影响用户看到的结果或产品走向的地方，先提问，不要自行发挥。
 - 交代没提到、做的过程中却发现必须新加存储、依赖或抽象，改核心结构或接口，或者做不可逆的迁移时，先提问：说明为什么需要、有没有更简单的做法，得到回答再动手。
-- 不要使用 agent-foreman 技能，不要再启动 codex${state.options.terraModel ? '；只允许下述 terra 界面操作子代理，不要派生其他子 Agent。' : '，也不要派生子 Agent。'}
+- 不要使用 agent-foreman 技能，不要再启动 codex${state.agent !== 'agy' && state.options.terraModel ? '；只允许下述 terra 界面操作子代理，不要派生其他子 Agent。' : '，也不要派生子 Agent。'}
 - 需要的工具（如某个 MCP 服务）一开始没出现时，先等 30 秒再查一次，仍然没有才算没有；不要一看不到就下结论或改用别的办法。
 - 只在工作目录 ${state.options.cd} 内写文件${state.options.addDirs.length ? `（另允许：${state.options.addDirs.join('、')}）` : ''}；不要修改其他位置，不要执行 git push；只有交代书明确要求时才 git commit，并且只提交到交代书指定的分支。
 - 提问：遇到必须先确认才能继续的问题，运行下面的命令（把命令超时设为 ${askWaitMin + 5} 分钟，即 ${(askWaitMin + 5) * 60_000} 毫秒）：
@@ -378,14 +399,18 @@ function protocolFooter(state) {
 - 进度：每完成一个步骤，向 ${path.join(dir, 'progress.log')} 追加一行「时间 步骤 结果」。
 - 长命令（安装、渲染、录屏等超过 1 分钟的命令）把输出 tee 到 ${path.join(dir, 'logs')}/ 下的日志文件，例如 \`cmd 2>&1 | tee ${path.join(dir, 'logs')}/render.log\`。
 - 自己做的取舍随时追加到 ${path.join(dir, 'decisions.md')}，每条写清决定和理由。
-- 到达交代中写明的关卡时停下。最终回复依次写：完成了什么、产物路径、自检结果、「我自己做的决定」（逐条列出，没有就写「无」）、未解决的问题。不要越过关卡继续做。${state.agent === 'dsh' ? '' : `
-- 派任何子代理（DSH 子任务、spawn_agent 子代理）时，防止意图在转述中丢失：交代开头写明「先读完原始交代 ${dir}/run-*.prompt.md（按序号全部读完），其中的用户意图、已定的决定和范围同样约束你」，再写这次交给它的具体部分：写清原因、方案（改哪些地方、用什么做法）和已定的决定，具体怎么写由它定，只有你已确切知道做法时才写到步骤；方案要先调研才定得下来的，先让它只交调研结果和方案建议，你定了再让它做；要求它交回自己做的决定。它交回后，你先对照原始交代里的用户意图检查有没有偏，再整合；它做的决定要并入你最终回复的「我自己做的决定」，注明来自哪个子代理。`}${state.agent === 'dsh' || !dshAvailable(state.options.cd) ? '' : `
+- 到达交代中写明的关卡时停下。最终回复依次写：完成了什么、产物路径、自检结果、「我自己做的决定」（逐条列出，没有就写「无」）、未解决的问题。不要越过关卡继续做。${['dsh', 'agy'].includes(state.agent) ? '' : `
+- 派任何子代理（DSH 子任务、spawn_agent 子代理）时，防止意图在转述中丢失：交代开头写明「先读完原始交代 ${dir}/run-*.prompt.md（按序号全部读完），其中的用户意图、已定的决定和范围同样约束你」，再写这次交给它的具体部分：写清原因、方案（改哪些地方、用什么做法）和已定的决定，具体怎么写由它定，只有你已确切知道做法时才写到步骤；方案要先调研才定得下来的，先让它只交调研结果和方案建议，你定了再让它做；要求它交回自己做的决定。它交回后，你先对照原始交代里的用户意图检查有没有偏，再整合；它做的决定要并入你最终回复的「我自己做的决定」，注明来自哪个子代理。`}${['dsh', 'agy'].includes(state.agent) || !dshAvailable(state.options.cd) ? '' : `
 前端 UI 设计的部分（页面和组件的视觉设计、布局、样式、交互外观，以及把它们实现成前端界面代码）交给 DSH 子代理：运行下面的命令派活（命令超时设为 10 分钟；它跟踪满 29 分钟会以退出码 8 交回，按最后一行的命令继续跟踪；退出码 7 表示它在提问，按提示回答后继续跟踪）：
   FOREMAN_RUN_DIR="${RUNS}" node "${SCRIPT}" start ${shellTask(state.task)}-界面-01 --agent dsh --cd <工作目录> <<'EOF'
   交代：用户要什么、已定的设计决定（配色、字号、间距、文案原文等）、要改哪些文件、不能碰什么、做完交回什么（截图或样稿路径）
   EOF
-多次派活把序号 01 递增。它在改的文件，你等它交回后再动。交回后你检查结果、整合进其余代码；其余工作（逻辑、数据、后端、测试、构建）你自己做。`}${state.options.terraModel ? `
-操作电脑界面的部分（computer use：点按软件界面、操作桌面应用，包括 Blender 建模）不要自己做，交给 terra 子代理：用 spawn_agent 派子代理完成，参数 model="${state.options.terraModel}"、reasoning_effort="${state.options.effort}"、fork_turns="none"（必须是 none，否则模型设置不生效）。在任务说明里写清它需要的全部上下文、要操作什么、做完交回什么；它做完后由你检查结果再继续。其余工作（写代码、跑命令、读写文件、生成）你自己做。` : ''}`;
+多次派活把序号 01 递增。它在改的文件，你等它交回后再动。交回后你检查结果、整合进其余代码；其余工作（逻辑、数据、后端、测试、构建）你自己做。`}${state.agent !== 'agy' && state.options.terraModel ? `
+操作电脑界面的部分（computer use：点按软件界面、操作桌面应用，包括 Blender 建模）不要自己做，交给 terra 子代理：用 spawn_agent 派子代理完成，参数 model="${state.options.terraModel}"、reasoning_effort="${state.options.effort}"、fork_turns="none"（必须是 none，否则模型设置不生效）。在任务说明里写清它需要的全部上下文、要操作什么、做完交回什么；它做完后由你检查结果再继续。其余工作（写代码、跑命令、读写文件、生成）你自己做。` : ''}${state.agent === 'agy' ? `
+- 工作目录（也就是当前目录）是 ${state.options.cd}，交代里的相对路径都按它算；运行目录 ${dir} 只用来写进度、日志和决定清单。
+- 提问一律用上面的 ask 命令，不要用 ask_question 工具：这里没有人能在界面上回答它。
+- ask 命令会一直等到有回答，最长 ${askWaitMin} 分钟。它如果被转到后台运行，用 command_status 等它结束、拿到输出里的回答后再继续，不要没等到就往下做。
+- 不要派生子代理（browser_subagent、invoke_subagent、define_subagent 等），全部自己做。` : ''}`;
 
 }
 
@@ -573,6 +598,39 @@ function buildDshArgs(state, resume) {
   return [...args, '-'];
 }
 
+async function configureAgy(state, request) {
+  const o = state.options;
+  if (!['low', 'medium', 'high'].includes(o.effort)) throw new Error('Antigravity --effort must be low, medium or high');
+  delete o.modelRequest;
+  delete o.terraModel;
+  if (request == null) return; // send inherits the resolved model without another catalog request.
+  if (request.toLowerCase() !== 'argon') { o.model = request; return; }
+  const output = await new Promise((resolve, reject) => {
+    const child = execFile(AGY_BIN, ['models'], { cwd: o.cd, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' },
+      (err, stdout, stderr) => {
+        if (!err) return resolve(stdout);
+        const error = stderr?.trim() || err.message;
+        reject(new Error(`${AGY_QUOTA.test(error) ? 'Argon 额度用完：' : 'agy models 失败：'}${error}`));
+      });
+    child.stdin.end();
+  });
+  const models = [...output.matchAll(/\bgemini-(\d+(?:\.\d+)*)-argon-(low|medium|high)\b/g)]
+    .filter((match) => match[2] === o.effort)
+    .map((match) => ({ slug: match[0], version: match[1] }))
+    .sort(compareModelVersions);
+  if (!models.length) throw new Error(`没有可用的 Argon 模型（推理档位 ${o.effort}）`);
+  o.model = models[0].slug;
+  feed(state, `argon → ${o.model}（推理档位 ${o.effort}）`);
+}
+function buildAgyArgs(state, prompt, resume) {
+  const args = ['-p', prompt, '--model', state.options.model, '--output-format', 'stream-json',
+    '--dangerously-skip-permissions', '--add-dir', runDir(state.task)];
+  for (const d of state.options.addDirs) args.push('--add-dir', d);
+  if (!state.options.fullAccess) args.push('--sandbox');
+  if (resume) args.push('--conversation', state.threadId);
+  return args;
+}
+
 function newestMtime(state) {
   const dir = runDir(state.task);
   let newest = 0;
@@ -657,6 +715,7 @@ function outOfScope(before, after, state) {
 // One codex invocation. Resolves to { status: completed|stalled|timeout|retryable|fatal, error }.
 function runTurn(state, prompt) {
   const isDsh = state.agent === 'dsh';
+  const isAgy = state.agent === 'agy';
   const n = state.turns.length + 1;
   const dir = runDir(state.task);
   const files = {
@@ -679,13 +738,13 @@ function runTurn(state, prompt) {
   }
   activity(state, '启动中');
   state.lastActivityAt = turn.startedAt;
-  feed(state, `▶ ${state.task} 第 ${n} 轮开始（${resume ? '接续会话' : '新会话'} · ${isDsh ? 'DSH · ' : ''}${state.options.model} · ${state.options.effort}）`);
+  feed(state, `▶ ${state.task} 第 ${n} 轮开始（${resume ? '接续会话' : '新会话'} · ${isDsh || isAgy ? `${agentName(state)} · ` : ''}${state.options.model} · ${state.options.effort}）`);
 
   // The sandbox already confines writes, and other sessions' edits would show up as false alarms.
   const gitBefore = state.options.fullAccess && state.options.gitRoot ? gitChanges(state.options.gitRoot) : null;
   return new Promise((resolve) => {
     const stderrFd = fs.openSync(files.stderr, 'a');
-    const child = spawn(isDsh ? DSH_BIN : CODEX_BIN, isDsh ? buildDshArgs(state, resume) : buildArgs(state, files.last, resume), {
+    const child = spawn(isAgy ? AGY_BIN : isDsh ? DSH_BIN : CODEX_BIN, isAgy ? buildAgyArgs(state, fullPrompt, resume) : isDsh ? buildDshArgs(state, resume) : buildArgs(state, files.last, resume), {
       cwd: state.options.cd, detached: true, stdio: ['pipe', 'pipe', stderrFd],
     });
     fs.closeSync(stderrFd);
@@ -694,7 +753,7 @@ function runTurn(state, prompt) {
     saveState(state);
     log(`turn ${n} started (pid ${child.pid}, ${resume ? `resume ${state.threadId}` : 'new thread'})`);
     child.stdin.on('error', () => { /* reported via the child 'error' event */ });
-    child.stdin.end(fullPrompt);
+    child.stdin.end(isAgy ? undefined : fullPrompt);
 
     const events = fs.createWriteStream(files.events);
     const started = Date.now();
@@ -714,6 +773,9 @@ function runTurn(state, prompt) {
     let buffer = '';
     let completed = false;
     let dshFinal = false;
+    let agyResult = false;
+    let agyResultTimer;
+    const agyResponses = new Map();
     let spawnFailed = false;
     let failure = '';
     let lastError = '';
@@ -736,6 +798,34 @@ function runTurn(state, prompt) {
       try { ev = JSON.parse(line); } catch { return; }
       eventVersion++;
       endGeneration();
+      if (isAgy) {
+        const step = ev.event === 'step_update' && ev.step_update;
+        if (step?.step_type === 'agent_response' && typeof step.text_delta === 'string') {
+          const text = (agyResponses.get(step.step_index) || '') + step.text_delta;
+          agyResponses.set(step.step_index, text);
+          state.intent = short(text, 100);
+          latestActivity = `说明：${state.intent}`;
+        } else latestActivity = agyActivity(ev) || latestActivity;
+        activity(state, latestActivity);
+        if (ev.event === 'init' && ev.conversation_id && !state.threadId) {
+          state.threadId = ev.conversation_id;
+          saveState(state);
+          log(`conversation ${ev.conversation_id}`);
+        } else if (ev.event === 'result' && !agyResult) {
+          agyResult = true;
+          completed = /^(success|completed|ok)$/i.test(ev.result?.status || '');
+          if (completed) {
+            const response = ev.result?.response;
+            fs.writeFileSync(files.last, typeof response === 'string' && response.trim() ? response : '（Antigravity 没有给出文字回复）');
+          } else {
+            const error = ev.result?.error || ev.result?.status || 'Antigravity result without status';
+            failure = typeof error === 'string' ? error : JSON.stringify(error);
+          }
+          // Some versions emit result but keep the process alive. The result remains authoritative.
+          if (!closed) agyResultTimer = setTimeout(() => { cleanup = killTree(child.pid); }, AGY_RESULT_EXIT_MS);
+        }
+        return;
+      }
       if (isDsh) {
         if (ev.type === 'text') state.intent = short(ev.text, 100);
         latestActivity = dshActivity(ev) || latestActivity;
@@ -810,6 +900,7 @@ function runTurn(state, prompt) {
 
     const mailboxTimer = setInterval(() => { scanMailbox(state); observeActivity(); }, 1000);
     const timer = setInterval(() => {
+      if (isAgy && agyResult) return;
       const active = observeActivity();
       const quietMs = Date.now() - active;
       const quiet = quietDuration(quietMs);
@@ -834,7 +925,8 @@ function runTurn(state, prompt) {
 
     child.on('close', async (code, signal) => {
       closed = true;
-      if (isDsh && buffer.trim()) handleLine(buffer);
+      if ((isDsh || isAgy) && buffer.trim()) handleLine(buffer);
+      clearTimeout(agyResultTimer);
       process.removeListener('SIGTERM', stopSampling);
       clearInterval(networkTimer);
       sampling?.abort();
@@ -848,17 +940,29 @@ function runTurn(state, prompt) {
       await new Promise((done) => events.end(done));
       turn.endedAt = now();
       turn.exit = code ?? signal;
+      let quotaText = failure;
+      if (isAgy && !(agyResult && completed)) {
+        try { quotaText += '\n' + fs.readFileSync(files.stderr, 'utf8'); } catch { /* none */ }
+      }
       let result;
-      if (killedFor) result = { status: killedFor, error: `${killedFor} (watchdog)` };
-      else if (completed && code === 0) result = { status: 'completed' };
+      if (isAgy && agyResult && completed) result = { status: 'completed' };
+      else if (isAgy && AGY_QUOTA.test(quotaText)) result = { status: 'fatal', error: `Argon 额度用完：${quotaText.trim()}` };
+      else if (killedFor && !(isAgy && agyResult)) result = { status: killedFor, error: `${killedFor} (watchdog)` };
+      else if (!isAgy && completed && code === 0) result = { status: 'completed' };
       else {
         let stderrTail = '';
         try { stderrTail = fs.readFileSync(files.stderr, 'utf8').split('\n').filter((l) => !/failed to load skill/.test(l)).slice(-15).join('\n'); } catch { /* none */ }
         const msg = failure || lastError || stderrTail || `exit ${code ?? signal}`;
         const dshFatal = isDsh && (spawnFailed || /MISSING_CREDENTIAL/.test(msg));
         const dshUnexpected = isDsh && !dshFinal && !spawnFailed && !failure && !lastError;
-        result = { status: dshFatal || FATAL.test(msg) ? 'fatal' : RETRYABLE.test(msg) || dshUnexpected ? 'retryable' : 'fatal',
-          error: (dshUnexpected ? `DSH 异常退出（未收到 final，exit ${code ?? signal}）：${msg}` : msg).slice(0, 1000) };
+        if (isAgy) {
+          const unexpected = !agyResult && !spawnFailed;
+          result = { status: spawnFailed || FATAL.test(msg) ? 'fatal' : unexpected || RETRYABLE.test(msg) ? 'retryable' : 'fatal',
+            error: (unexpected ? `Antigravity 异常退出（未收到 result，exit ${code ?? signal}）：${stderrTail}` : msg).slice(0, 1000) };
+        } else {
+          result = { status: dshFatal || FATAL.test(msg) ? 'fatal' : RETRYABLE.test(msg) || dshUnexpected ? 'retryable' : 'fatal',
+            error: (dshUnexpected ? `DSH 异常退出（未收到 final，exit ${code ?? signal}）：${msg}` : msg).slice(0, 1000) };
+        }
       }
       if (result.status === 'completed') {
         let reply = '';
@@ -1049,9 +1153,9 @@ function scanMailbox(state) {
     const q = readJSON(file);
     const chars = Array.from(q.text);
     const text = chars.length > 3000 ? chars.slice(0, 3000).join('') + `…（完整内容见 ${file}）` : q.text;
-    publish(`q-${q.n}`, `❓ ${state.task} 提问 #${q.n}${q.noWait ? `（不阻塞，${state.agent === 'dsh' ? 'DSH' : 'Codex'} 先按自己的倾向继续）` : ''}：${text}`);
+    publish(`q-${q.n}`, `❓ ${state.task} 提问 #${q.n}${q.noWait ? `（不阻塞，${agentName(state)} 先按自己的倾向继续）` : ''}：${text}`);
     const outcome = readJSON(mailPath(state.task, 'outcomes', `q-${q.n}`));
-    if (outcome?.status === 'timedout') publish(`timeout-${q.n}`, `⏳ ${state.task} #${q.n} 等了 ${q.waitMin} 分钟没有回答，${state.agent === 'dsh' ? 'DSH' : 'Codex'} 按约定处理`);
+    if (outcome?.status === 'timedout') publish(`timeout-${q.n}`, `⏳ ${state.task} #${q.n} 等了 ${q.waitMin} 分钟没有回答，${agentName(state)} 按约定处理`);
     if (fs.existsSync(mailPath(state.task, 'answers', `a-${q.n}`))) publish(`a-${q.n}`, `💬 ${state.task} #${q.n} 已收到回答`);
   }
   for (const file of mailFiles(state.task, 'notes')) publish(`note-${path.basename(file)}`, `✉ ${state.task} 已收到留言`);
@@ -1109,6 +1213,7 @@ async function launchSupervisor(task) {
 async function main() {
   const { cmd, task, opts } = parseArgs(process.argv.slice(2));
   if (cmd === 'models') {
+    if (opts.agent === 'agy') throw new Error('Antigravity 不使用 Codex 模型目录；请用 agy models 查看');
     if (opts.agent === 'dsh') throw new Error('DSH 不使用 Codex 模型目录；start --agent dsh --model 可用 flash、pro 或型号名');
     const effort = opts.effort || DEFAULTS.effort;
     // Share a single live catalog across the resolutions printed by this command.
@@ -1188,7 +1293,7 @@ async function main() {
     if (!fs.existsSync(opts.cd) || !fs.statSync(opts.cd).isDirectory()) throw new Error(`Work dir does not exist: ${opts.cd}`);
     if (fs.existsSync(statePath(task))) throw new Error(`Task ${task} already exists; use resume or pick a new name.`);
     const { brief, message, agent: _agent, ...rest } = opts;
-    state = { task, agent, createdAt: now(), status: 'new', threadId: null, pid: null, turns: [], options: { ...DEFAULTS, ...(agent === 'dsh' ? { model: 'deepseek-flash' } : {}), fullAccess: true, ...rest } };
+    state = { task, agent, createdAt: now(), status: 'new', threadId: null, pid: null, turns: [], options: { ...DEFAULTS, ...(agent === 'dsh' ? { model: 'deepseek-flash' } : agent === 'agy' ? { model: 'argon' } : {}), fullAccess: true, ...rest } };
     try { state.options.gitRoot = execFileSync('git', ['-C', opts.cd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { state.options.gitRoot = null; }
     prompt = await readPrompt(brief);
   } else if (cmd === 'resume' || cmd === 'send') {
@@ -1208,6 +1313,7 @@ async function main() {
   fs.mkdirSync(path.join(runDir(task), 'logs'), { recursive: true });
   const offset = feedSize(task);
   if (agent === 'dsh') configureDsh(state);
+  else if (agent === 'agy') await configureAgy(state, cmd === 'start' ? state.options.model : opts.model ?? (opts.effort != null ? 'argon' : undefined));
   else {
     // Share the live catalog, including a failed request, across both resolutions.
     let catalog;

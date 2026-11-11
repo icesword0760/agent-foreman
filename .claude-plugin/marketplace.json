@@ -8,7 +8,7 @@
     {
       "name": "agent-foreman",
       "source": "./",
-      "description": "Let Claude Code direct Codex CLI (and optionally DSH) like a foreman: write a brief, dispatch, watch live events, answer questions, accept by evidence."
+      "description": "Let Claude Code direct Codex CLI (and optionally DSH or Antigravity) like a foreman: write a brief, dispatch, watch live events, answer questions, accept by evidence."
     }
   ]
 }

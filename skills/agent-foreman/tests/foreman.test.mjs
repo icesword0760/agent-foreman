@@ -1275,18 +1275,21 @@ test('watch attachment uses the answer file when waiting state has not refreshed
   fs.mkdirSync(path.join(root, 'task', 'answers'), { recursive: true });
   fs.writeFileSync(mailPath('task', 'answers', 'a-1'), JSON.stringify({ n: 1, text: '已回答' }));
   const source = fs.readFileSync(script, 'utf8');
-  const watchSource = source.slice(source.indexOf('async function watch('), source.indexOf('// Appended to every prompt'));
-  for (const [waiting, expected] of [
-    [1, '进行中：已回答 #1，等待 Codex 继续（已运行 45秒）'],
-    [2, '等待回答 #2：尚未刷新'],
-    [undefined, '进行中：运行 npm test（已运行 45秒）'],
+  const watchSource = source.match(/^const agentName = .*$/m)[0] + '\n'
+    + source.slice(source.indexOf('async function watch('), source.indexOf('// Appended to every prompt'));
+  for (const [agent, waiting, expected] of [
+    [undefined, 1, '进行中：已回答 #1，等待 Codex 继续（已运行 45秒）'],
+    [undefined, 2, '等待回答 #2：尚未刷新'],
+    [undefined, undefined, '进行中：运行 npm test（已运行 45秒）'],
+    ['dsh', 1, '进行中：已回答 #1，等待 DSH 继续（已运行 45秒）'],
+    ['agy', 1, '进行中：已回答 #1，等待 Antigravity 继续（已运行 45秒）'],
   ]) {
     let reads = 0;
     const lines = [];
     const watch = vm.runInNewContext(watchSource + '\nwatch', {
       fs, path, mailPath, Date,
       loadState: () => ++reads === 1 ? {
-        status: 'running', waitingQuestions: waiting == null ? [] : [waiting],
+        agent, status: 'running', waitingQuestions: waiting == null ? [] : [waiting],
         waitingQuestionText: '尚未刷新', activity: '运行 npm test', runStartedAt: new Date().toISOString(),
       } : { status: 'completed', exitCode: 0 },
       terminal: (state) => state.status === 'completed',
@@ -1454,7 +1457,8 @@ for (const command of ['start', 'send', 'resume', 'watch']) test(`${command}: wa
 
 test('watch deadline: unseen blocking question takes precedence over code 8; default is 29 minutes', async () => {
   const source = fs.readFileSync(script, 'utf8');
-  const watchSource = source.slice(source.indexOf('async function watch('), source.indexOf('// Appended to every prompt'));
+  const watchSource = source.match(/^const agentName = .*$/m)[0] + '\n'
+    + source.slice(source.indexOf('async function watch('), source.indexOf('// Appended to every prompt'));
   for (const question of [undefined, { n: 1 }]) {
     let time = 0;
     const lines = [];
@@ -2202,4 +2206,366 @@ test('Codex: explicit agent and legacy state without agent retain Codex behavior
   assert.equal((await f.run(['send', 'task'], 'legacy')).code, 0);
   assert.equal(f.calls().at(-1).argv[0], 'exec');
   assert.equal(f.state().agent, 'codex');
+});
+
+function agyFixture(t, scenario = 'ok') {
+  const f = agentStatusFixture(t, scenario);
+  f.env.AGY_BIN = path.join(repo, 'tests/fixtures/fake-agy.mjs');
+  return { ...f, start: (extra = []) => f.start(['--agent', 'agy', ...extra]) };
+}
+function agyModelCalls(f) {
+  const file = path.join(f.root, 'fake/agy-model-calls.jsonl');
+  return fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse) : [];
+}
+
+test('Antigravity: default launch resolves Argon, records init, streams reply and publishes display name', async (t) => {
+  const f = agyFixture(t);
+  writeConfig(f, 'model_instructions_file = "/must-not-affect-agy"\n');
+  const result = await f.run(f.start(['--add-dir', os.tmpdir(), '--add-dir', f.root, '--ask-wait-min', '7']), 'AGY brief\n全文保留');
+  assert.equal(result.code, 0, result.stderr);
+  const s = f.state(), call = f.calls()[0];
+  assert.equal(s.agent, 'agy');
+  assert.equal(s.options.model, 'gemini-3.8-argon-high');
+  assert.equal(s.options.effort, 'high');
+  assert.equal(s.threadId, 'conversation-fake-agy-001');
+  assert.equal(s.options.modelRequest, undefined);
+  assert.equal(s.options.terraModel, undefined);
+  assert.equal(modelCalls(f).length, 0);
+  assert.equal(agyModelCalls(f).length, 1);
+  assert.deepEqual(call.argv, ['-p', call.prompt, '--model', s.options.model, '--output-format', 'stream-json',
+    '--dangerously-skip-permissions', '--add-dir', path.join(f.runs, 'task'), '--add-dir', path.resolve(os.tmpdir()), '--add-dir', f.root]);
+  assert.equal(call.stdin, '');
+  assert.equal(fs.realpathSync(call.cwd), fs.realpathSync(f.root));
+  assert.ok(call.prompt.startsWith('AGY brief\n全文保留\n\n---'));
+  assert.doesNotMatch(call.prompt, /派任何子代理|前端 UI 设计的部分|terra|spawn_agent|computer use/);
+  for (const text of [
+    `工作目录（也就是当前目录）是 ${f.root}，交代里的相对路径都按它算；运行目录 ${path.join(f.runs, 'task')} 只用来写进度、日志和决定清单。`,
+    '提问一律用上面的 ask 命令，不要用 ask_question 工具：这里没有人能在界面上回答它。',
+    'ask 命令会一直等到有回答，最长 7 分钟。', '用 command_status 等它结束、拿到输出里的回答后再继续，不要没等到就往下做。',
+    '不要派生子代理（browser_subagent、invoke_subagent、define_subagent 等），全部自己做。',
+    '不要使用 agent-foreman 技能，不要再启动 codex，也不要派生子 Agent。',
+    ' ask task', ' inbox task', 'progress.log', 'decisions.md',
+  ]) assert.ok(call.prompt.includes(text), text);
+  const reply = '假 Antigravity 回复：任务完成。\n第二行完整保留。\n我自己做的决定：无';
+  assert.equal(fs.readFileSync(s.turns[0].files.last, 'utf8'), reply);
+  assert.match(fs.readFileSync(s.turns[0].files.events, 'utf8'), /"event":"result"/);
+  assert.match(f.feed(), /Antigravity · gemini-3.8-argon-high · high/);
+  assert.match(result.stdout, /--- Antigravity 回复 ---/);
+  assert.equal(f.agent().label, 'Antigravity：task（gemini-3.8-argon-high · 高档推理）');
+  assert.equal(f.agent().state, 'completed');
+  assert.match((await f.run(['watch', 'task'])).stdout, /--- Antigravity 回复 ---/);
+  assert.match((await f.run(['status', 'task'])).stdout, /"agent": "agy"/);
+});
+
+for (const command of ['send', 'resume']) test(`Antigravity: ${command} inherits conversation/model and resolves only explicit overrides`, async (t) => {
+  const f = agyFixture(t);
+  assert.equal((await f.run(f.start(['--sandbox']), 'initial')).code, 0);
+  assert.ok(f.calls()[0].argv.includes('--sandbox'));
+  await until(() => !alive(f.state().supervisorPid));
+  const s = f.state();
+  s.options.modelRequest = 'sol';
+  s.options.terraModel = 'gpt-6.1-terra';
+  fs.writeFileSync(path.join(f.runs, 'task/state.json'), JSON.stringify(s));
+  f.env.FAKE_AGY_MODELS_MODE = 'fail';
+  assert.equal((await f.run([command, 'task'], 'follow up')).code, 0);
+  assert.equal(agyModelCalls(f).length, 1);
+  assert.equal(f.state().options.modelRequest, undefined);
+  assert.equal(f.state().options.terraModel, undefined);
+  assert.ok(f.calls()[1].argv.includes('--sandbox'));
+  assert.equal(f.calls()[1].argv[f.calls()[1].argv.indexOf('--conversation') + 1], s.threadId);
+  assert.equal(f.state().options.model, s.options.model);
+  await until(() => !alive(f.state().supervisorPid));
+  delete f.env.FAKE_AGY_MODELS_MODE;
+  f.env.FAKE_AGY_MODELS = 'gemini-4.10-argon-medium\ngemini-4.9-argon-medium';
+  assert.equal((await f.run([command, 'task', '--effort', 'medium', '--full-access'], 'new effort')).code, 0);
+  assert.equal(f.state().options.model, 'gemini-4.10-argon-medium');
+  assert.equal(agyModelCalls(f).length, 2);
+  assert.equal(f.calls()[2].argv.includes('--sandbox'), false);
+  await until(() => !alive(f.state().supervisorPid));
+  assert.equal((await f.run([command, 'task', '--model', 'explicit-custom'], 'explicit')).code, 0);
+  assert.equal(f.state().options.model, 'explicit-custom');
+  assert.equal(agyModelCalls(f).length, 2);
+  await until(() => !alive(f.state().supervisorPid));
+  assert.equal((await f.run([command, 'task', '--model', 'argon'], 'keyword')).code, 0);
+  assert.equal(f.state().options.model, 'gemini-4.10-argon-medium');
+  assert.equal(agyModelCalls(f).length, 3);
+});
+
+for (const effort of ['low', 'medium', 'high']) test(`Antigravity: numeric Argon versions and exact effort ${effort}`, async (t) => {
+  const f = agyFixture(t);
+  f.env.FAKE_AGY_MODELS = `gemini-3.9-argon-${effort}\ngemini-3.10-argon-${effort}\ngemini-3.10.2-argon-${effort}\ngemini-99.0-flash-${effort}\ngemini-98.0-argon-other`;
+  assert.equal((await f.run(f.start(['--model', 'ArGoN', '--effort', effort]), 'models')).code, 0);
+  assert.equal(f.state().options.model, `gemini-3.10.2-argon-${effort}`);
+});
+
+test('Antigravity: unavailable effort fails without cache, model or executor fallback', async (t) => {
+  const f = agyFixture(t);
+  writeModelCache(f, { model: 'gemini-99.0-argon-high' });
+  f.env.FAKE_AGY_MODELS = 'gemini-3.8-argon-low\ngemini-9.0-flash-high';
+  const result = await f.run(f.start(), 'missing Argon');
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /没有可用的 Argon 模型（推理档位 high）/);
+  assert.equal(fs.existsSync(path.join(f.root, 'fake/calls.jsonl')), false);
+  assert.equal(modelCalls(f).length, 0);
+});
+
+test('Antigravity: failed models command does not use cache', async (t) => {
+  const f = agyFixture(t);
+  writeModelCache(f);
+  f.env.FAKE_AGY_MODELS_MODE = 'fail';
+  const result = await f.run(f.start(), 'failed catalog');
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /agy models 失败：catalog unavailable/);
+  assert.equal(fs.existsSync(path.join(f.root, 'fake/calls.jsonl')), false);
+});
+
+test('Antigravity: models times out after 20 seconds and leaves no process', async (t) => {
+  const f = agyFixture(t);
+  f.env.FAKE_AGY_MODELS_MODE = 'timeout';
+  const begin = Date.now();
+  const result = await f.run(f.start(), 'timeout catalog');
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /agy models 失败/);
+  assert.ok(Date.now() - begin >= 19_000 && Date.now() - begin < 25_000);
+  assert.equal(alive(agyModelCalls(f)[0].pid), false);
+});
+
+test('Antigravity: explicit model bypasses lookup and PATH agy is supported', async (t) => {
+  const f = agyFixture(t);
+  const bin = path.join(f.root, 'bin');
+  fs.mkdirSync(bin);
+  fs.symlinkSync(f.env.AGY_BIN, path.join(bin, 'agy'));
+  delete f.env.AGY_BIN;
+  f.env.PATH = `${bin}:${process.env.PATH}`;
+  f.env.FAKE_AGY_MODELS_MODE = 'fail';
+  const explicit = 'gemini-3.8-argon-high-custom';
+  assert.equal((await f.run(f.start(['--model', explicit]), 'explicit')).code, 0);
+  assert.equal(f.state().options.model, explicit);
+  assert.equal(agyModelCalls(f).length, 0);
+});
+
+for (const effort of ['off', 'minimal', 'xhigh', 'max', 'ultra']) test(`Antigravity: rejects effort ${effort}`, async (t) => {
+  const f = agyFixture(t);
+  const result = await f.run(f.start(['--effort', effort]), 'invalid');
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Antigravity --effort must be low, medium or high/);
+  assert.equal(agyModelCalls(f).length, 0);
+});
+
+test('Antigravity: models command redirects to agy models and send rejects agent switching', async (t) => {
+  const f = agyFixture(t);
+  const result = await f.run(['models', '--agent', 'agy']);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /请用 agy models 查看/);
+  assert.equal((await f.run(f.start(), 'initial')).code, 0);
+  await until(() => !alive(f.state().supervisorPid));
+  assert.equal((await f.run(['send', 'task', '--agent', 'codex'], 'switch')).code, 1);
+  assert.equal(f.calls().length, 1);
+});
+
+for (const [source, error] of [
+  ['result', '429 RESOURCE_EXHAUSTED: Individual quota reached. Resets in 79h'],
+  ['result', 'individual QUOTA reached. Resets in 79h'],
+  ['stderr', 'RESOURCE_EXHAUSTED 429\nResets in 79h'],
+  ['stderr', '额度用完，明天恢复'],
+  ['stderr', 'Resets in 79h'],
+]) test(`Antigravity: quota in ${source}: ${error} is fatal before retry classification`, async (t) => {
+  const f = agyFixture(t, 'fatal');
+  f.env.FAKE_AGY_ERROR = source === 'result' ? error : '429 service busy';
+  if (source === 'stderr') f.env.FAKE_AGY_STDERR = error + '\n' + 'noise\n'.repeat(20);
+  const result = await f.run(f.start(), 'quota');
+  assert.equal(result.code, 2);
+  assert.equal(f.calls().length, 1);
+  assert.equal(f.state().turns[0].result, 'fatal');
+  assert.ok(f.state().error.startsWith('Argon 额度用完：'));
+  assert.ok(f.state().error.includes(error));
+  assert.doesNotMatch(f.feed(), /次重试/);
+});
+
+for (const scenario of ['empty', 'no-newline']) test(`Antigravity: ${scenario} result writes final reply`, async (t) => {
+  const f = agyFixture(t, scenario);
+  const result = await f.run(f.start(), 'reply');
+  assert.equal(result.code, 0, result.stderr);
+  const reply = fs.readFileSync(f.state().turns[0].files.last, 'utf8');
+  assert.equal(reply, scenario === 'empty' ? '（Antigravity 没有给出文字回复）' : '假 Antigravity 回复：任务完成。\n第二行完整保留。\n我自己做的决定：无');
+  assert.equal(/缺少「我自己做的决定」/.test(f.feed()), scenario === 'empty');
+});
+
+for (const status of ['success', 'CoMpLeTeD', 'ok']) test(`Antigravity: result ${status} succeeds regardless of exit code`, async (t) => {
+  const f = agyFixture(t);
+  f.env.FAKE_AGY_STATUS = status;
+  f.env.FAKE_AGY_EXIT = '23';
+  assert.equal((await f.run(f.start(), 'result authoritative')).code, 0);
+  assert.equal(f.state().turns[0].exit, 23);
+});
+
+for (const success of [true, false]) test(`Antigravity: result then hang is cleaned up and stays ${success ? 'completed' : 'fatal'}`, async (t) => {
+  const f = agyFixture(t, success ? 'result-hang' : 'fatal');
+  f.env.FOREMAN_AGY_RESULT_EXIT_MS = '700';
+  if (!success) { f.env.FAKE_AGY_HANG_ERROR = '1'; f.env.FAKE_AGY_ERROR = 'invalid api key'; }
+  const begin = Date.now();
+  const result = await f.run(f.start(['--idle-min', '0.005', '--max-min', '0.005']), 'result hang');
+  assert.equal(result.code, success ? 0 : 2, result.stderr);
+  assert.equal(f.state().turns[0].result, success ? 'completed' : 'fatal');
+  assert.ok(Date.now() - begin < 10_000);
+  assert.equal(alive(f.calls()[0].pid), false);
+  assert.equal(f.calls().length, 1);
+});
+
+test('Antigravity: missing result retries abnormal exits and preserves conversation', async (t) => {
+  const f = agyFixture(t, 'missing-result-then-ok');
+  assert.equal((await f.run(f.start(), 'missing result')).code, 0);
+  assert.deepEqual(f.state().turns.map((turn) => turn.result), ['retryable', 'completed']);
+  assert.match(f.state().turns[0].error, /Antigravity 异常退出（未收到 result，exit 0）：executor exited unexpectedly/);
+  assert.equal(f.calls()[1].argv[f.calls()[1].argv.indexOf('--conversation') + 1], f.state().threadId);
+  assert.equal(agyModelCalls(f).length, 1);
+  assert.match(f.calls()[1].prompt, /不要重做已经完成的部分/);
+  const failed = agyFixture(t, 'abnormal');
+  failed.env.FAKE_AGY_EXIT = '23';
+  assert.equal((await failed.run(failed.start(), 'abnormal')).code, 3);
+  assert.equal(failed.calls().length, 2);
+});
+
+for (const [error, status] of [['429 service busy', 'retryable'], ['stream disconnected', 'retryable'], ['401 unauthorized rate limit', 'fatal'], ['invalid api key', 'fatal'], ['unknown error', 'fatal']]) {
+  test(`Antigravity: result error ${error} uses existing error rules`, async (t) => {
+    const f = agyFixture(t, status === 'retryable' ? 'retry-then-ok' : 'fatal');
+    f.env.FAKE_AGY_ERROR = error;
+    assert.equal((await f.run(f.start(), 'error rules')).code, status === 'retryable' ? 0 : 2);
+    assert.equal(f.state().turns[0].result, status);
+  });
+}
+
+test('Antigravity: error without text falls back to result status', async (t) => {
+  const f = agyFixture(t, 'fatal');
+  f.env.FAKE_AGY_STATUS = 'DENIED';
+  assert.equal((await f.run(f.start(), 'status error')).code, 2);
+  assert.equal(f.state().error, 'DENIED');
+});
+
+for (const mode of ['missing', 'not-executable']) test(`Antigravity: ${mode} binary is a fatal spawn failure`, async (t) => {
+  const f = agyFixture(t);
+  f.env.AGY_BIN = path.join(f.root, 'agy');
+  if (mode === 'not-executable') fs.writeFileSync(f.env.AGY_BIN, '#!/bin/sh\nexit 0\n', { mode: 0o600 });
+  const result = await f.run(f.start(['--model', 'gemini-3.8-argon-high']), 'missing executable');
+  assert.equal(result.code, 2);
+  assert.equal(f.state().turns.length, 1);
+  assert.equal(f.state().turns[0].result, 'fatal');
+  assert.match(f.state().error, /spawn failed:.*agy.*(ENOENT|EACCES)/);
+  assert.equal(f.state().pid, null);
+});
+
+test('Antigravity: live tool activities and response deltas update intent and Matou', async (t) => {
+  const f = agyFixture(t, 'activity');
+  f.env.FAKE_AGY_GATE = path.join(f.root, 'gate');
+  const running = f.launch(f.start(), 'activity');
+  await until(() => fs.existsSync(path.join(f.runs, 'task/state.json')) && f.state().activity === '运行 echo hello');
+  const activities = ['跑完 echo hello', '说明：正在', '说明：正在整理数据', '说明：新的一步', '修改 example.txt', '搜索 Argon 使用说明'];
+  for (const [i, text] of activities.entries()) {
+    fs.writeFileSync(`${f.env.FAKE_AGY_GATE}.${i}`, '');
+    await until(() => f.state().activity === text);
+    assert.equal(f.agent().detail, text);
+  }
+  assert.equal(f.state().intent, '新的一步');
+  fs.writeFileSync(`${f.env.FAKE_AGY_GATE}.done`, '');
+  assert.equal((await running.result).code, 0);
+});
+
+test('Antigravity: activity handles mailbox commands, all file tools, reads and Unicode query bounds', () => {
+  const source = fs.readFileSync(script, 'utf8');
+  const functions = source.slice(source.indexOf('function commandDescription('), source.indexOf('function finalText('));
+  const describe = vm.runInNewContext(functions + '\nagyActivity', { path, short: (s, n) => Array.from(String(s ?? '').split(/\r?\n/)[0]).slice(0, n).join('') });
+  const tool = (name, parameters, state = 'ACTIVE') => describe({ event: 'step_update', step_update: { step_type: 'tool', tool_info: { name, parameters }, state } });
+  assert.equal(tool('run_command', { CommandLine: 'node /tmp/foreman.mjs ask task --no-wait' }), '提问（不阻塞）');
+  assert.equal(tool('run_command', { CommandLine: 'node /tmp/foreman.mjs ask task' }), '提问');
+  assert.equal(tool('run_command', { CommandLine: 'node /tmp/foreman.mjs inbox task' }), '查看信箱');
+  for (const name of ['write_file', 'write_to_file', 'replace_file_content', 'multi_replace_file_content', 'sed_file', 'notebook_edit']) {
+    assert.equal(tool(name, { content: 'text', ignoreFile: 7, TargetFile: '/tmp/name.txt', Path: '/tmp/second.txt' }), '修改 name.txt');
+  }
+  assert.equal(tool('view_file', { AbsolutePath: '/tmp/read.txt' }), '读取 read.txt');
+  assert.equal(tool('search_web', { query: '字😀'.repeat(20) }), '搜索 ' + '字😀'.repeat(16));
+  assert.equal(tool('other', {}), '调用工具 other');
+});
+
+test('Antigravity: shared watchdog detects stall, retries and completes', async (t) => {
+  const f = agyFixture(t, 'stall-then-ok');
+  assert.equal((await f.run(f.start(['--idle-min', '0.01', '--warn-min', '0.005']), 'stall')).code, 0);
+  assert.deepEqual(f.state().turns.map((turn) => turn.result), ['stalled', 'completed']);
+  assert.match(f.feed(), /没有动静/);
+});
+
+test('Antigravity: blocking ask survives idle limit, answer/note/inbox resume the same task', async (t) => {
+  const f = agyFixture(t, 'ask-protocol');
+  assert.equal((await f.run(f.start(), 'ask')).code, 7);
+  await until(() => f.state().waitingQuestions?.length === 1 && f.agent().state === 'waiting');
+  await sleep(3500);
+  assert.equal(f.state().turns.length, 1);
+  assert.equal((await f.run(['note', 'task'], '整理结果保留原顺序')).code, 0);
+  assert.equal((await f.run(['answer', 'task', '1'], '选择 A')).code, 0);
+  const watching = await f.run(['watch', 'task']);
+  assert.equal(watching.code, 0, watching.stderr);
+  assert.match(watching.stdout, /--- Antigravity 回复 ---/);
+  assert.equal(fs.readFileSync(path.join(f.root, 'fake/answer.txt'), 'utf8'), '选择 A');
+  assert.match(fs.readFileSync(path.join(f.root, 'fake/inbox.txt'), 'utf8'), /整理结果保留原顺序/);
+});
+
+test('Antigravity: nonblocking question and timeout events use the display name', async (t) => {
+  const f = agyFixture(t, 'hang');
+  assert.equal((await f.run(f.start(['--no-watch']), 'questions')).code, 0);
+  assert.equal((await f.run(['ask', 'task', '--no-wait'], '继续吗')).code, 0);
+  await until(() => /不阻塞，Antigravity/.test(f.feed()));
+  await f.run(['ask', 'task', '--wait-min', '0.005'], '等不到回答');
+  await until(() => /Antigravity 按约定处理/.test(f.feed()));
+});
+
+test('Antigravity: shared out-of-scope report detects external git changes', async (t) => {
+  const f = agyFixture(t, 'scope-change');
+  assert.equal(spawnSync('git', ['init', f.root]).status, 0);
+  const sub = path.join(fs.realpathSync(f.root), 'sub');
+  fs.mkdirSync(sub);
+  fs.mkdirSync(path.join(f.root, 'outside'));
+  fs.writeFileSync(path.join(f.root, '.gitignore'), '/fake/\n/runs/\n/agents/\n');
+  f.env.FAKE_SCOPE_ROOT = f.root;
+  assert.equal((await f.run(f.start(['--cd', sub]), 'scope')).code, 0);
+  assert.match(f.feed(), /outside\/turn-1\.txt/);
+  assert.doesNotMatch(f.feed(), /inside-1\.txt/);
+});
+
+test('Antigravity: nettop samples the executor tree and stop cleans its worker', { skip: process.platform !== 'darwin' }, async (t) => {
+  const f = agyFixture(t, 'network');
+  f.env.FOREMAN_NETTOP = path.join(repo, 'tests/fixtures/fake-nettop.mjs');
+  f.env.FAKE_NETTOP_MODE = 'grow';
+  f.env.PATH = `${path.join(repo, 'tests/fixtures')}:${process.env.PATH}`;
+  assert.equal((await f.run(f.start(['--no-watch', '--idle-min', '0.12', '--warn-min', '0.1', '--retries', '0']), 'network')).code, 0);
+  await until(() => f.state().activity?.startsWith('生成中'));
+  const worker = Number(fs.readFileSync(path.join(f.root, 'fake/worker.pid'), 'utf8'));
+  const samples = fs.readFileSync(path.join(f.root, 'fake/nettop-calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(samples.some(({ args }) => args.includes(String(worker))));
+  assert.equal((await f.run(['stop', 'task'])).code, 0);
+  assert.equal(alive(worker), false);
+});
+
+test('Antigravity: stderr quota takes precedence over watchdog retry without a result', async (t) => {
+  const f = agyFixture(t, 'hang');
+  f.env.FAKE_AGY_STDERR = 'RESOURCE_EXHAUSTED 429. Resets in 79h';
+  const result = await f.run(f.start(['--idle-min', '0.01', '--warn-min', '0.005']), 'quota stderr');
+  assert.equal(result.code, 2);
+  assert.equal(f.calls().length, 1);
+  assert.equal(f.state().turns[0].result, 'fatal');
+  assert.match(f.state().error, /^Argon 额度用完：RESOURCE_EXHAUSTED 429. Resets in 79h/);
+  assert.doesNotMatch(f.feed(), /次重试/);
+});
+
+
+test('Antigravity: SUCCESS result completes despite RESOURCE_EXHAUSTED in stderr', async (t) => {
+  const f = agyFixture(t);
+  f.env.FAKE_AGY_STATUS = 'SUCCESS';
+  f.env.FAKE_AGY_STDERR = 'Warning: RESOURCE_EXHAUSTED in diagnostic log';
+  const result = await f.run(f.start(), 'successful result with quota log');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().status, 'completed');
+  assert.equal(f.state().turns[0].result, 'completed');
+  assert.equal(f.state().error, null);
+  assert.equal(f.calls().length, 1);
+  assert.equal(f.agent().state, 'completed');
+  assert.doesNotMatch(f.feed(), /Argon 额度用完|次重试/);
 });
