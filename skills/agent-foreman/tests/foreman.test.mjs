@@ -2242,20 +2242,20 @@ function agyModelCalls(f) {
   return fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse) : [];
 }
 
-test('Antigravity: default launch resolves Hydrogen high, records init, streams reply and publishes display name', async (t) => {
+test('Antigravity: default launch uses fixed Orchestrator without catalog lookup, records init, streams reply and publishes display name', async (t) => {
   const f = agyFixture(t);
   writeConfig(f, 'model_instructions_file = "/must-not-affect-agy"\n');
   const result = await f.run(f.start(['--add-dir', os.tmpdir(), '--add-dir', f.root, '--ask-wait-min', '7']), 'AGY brief\n全文保留');
   assert.equal(result.code, 0, result.stderr);
   const s = f.state(), call = f.calls()[0];
   assert.equal(s.agent, 'agy');
-  assert.equal(s.options.model, 'gemini-4-hydrogen-high');
+  assert.equal(s.options.model, 'gemini-pro-orchestrator');
   assert.equal(s.options.effort, 'high');
   assert.equal(s.threadId, 'conversation-fake-agy-001');
   assert.equal(s.options.modelRequest, undefined);
   assert.equal(s.options.terraModel, undefined);
   assert.equal(modelCalls(f).length, 0);
-  assert.equal(agyModelCalls(f).length, 1);
+  assert.equal(agyModelCalls(f).length, 0);
   assert.deepEqual(call.argv, ['-p', call.prompt, '--model', s.options.model, '--output-format', 'stream-json',
     '--dangerously-skip-permissions', '--add-dir', path.join(f.runs, 'task'), '--add-dir', path.resolve(os.tmpdir()), '--add-dir', f.root]);
   assert.equal(call.stdin, '');
@@ -2273,9 +2273,11 @@ test('Antigravity: default launch resolves Hydrogen high, records init, streams 
   const reply = '假 Antigravity 回复：任务完成。\n第二行完整保留。\n我自己做的决定：无';
   assert.equal(fs.readFileSync(s.turns[0].files.last, 'utf8'), reply);
   assert.match(fs.readFileSync(s.turns[0].files.events, 'utf8'), /"event":"result"/);
-  assert.match(f.feed(), /Antigravity · gemini-4-hydrogen-high · high/);
+  assert.match(f.feed(), /第 1 轮开始（新会话 · Antigravity · gemini-pro-orchestrator）/);
   assert.match(result.stdout, /--- Antigravity 回复 ---/);
-  assert.equal(f.agent().label, 'Antigravity：task（gemini-4-hydrogen-high · 高档推理）');
+  assert.equal(f.agent().label, 'Antigravity：task（gemini-pro-orchestrator）');
+  assert.doesNotMatch(f.agent().label, /推理/);
+  assert.match((await f.run(['status', 'task'])).stdout, /"effort": null/);
   assert.equal(f.agent().state, 'completed');
   assert.match((await f.run(['watch', 'task'])).stdout, /--- Antigravity 回复 ---/);
   assert.match((await f.run(['status', 'task'])).stdout, /"agent": "agy"/);
@@ -2283,7 +2285,7 @@ test('Antigravity: default launch resolves Hydrogen high, records init, streams 
 
 for (const command of ['send', 'resume']) test(`Antigravity: ${command} inherits conversation/model and resolves only explicit overrides`, async (t) => {
   const f = agyFixture(t);
-  assert.equal((await f.run(f.start(['--sandbox']), 'initial')).code, 0);
+  assert.equal((await f.run(f.start(['--sandbox', '--model', 'hydrogen']), 'initial')).code, 0);
   assert.ok(f.calls()[0].argv.includes('--sandbox'));
   await until(() => !alive(f.state().supervisorPid));
   const s = f.state();
@@ -2326,7 +2328,7 @@ test('Antigravity: unavailable effort fails without cache, model or executor fal
   const f = agyFixture(t);
   writeModelCache(f, { model: 'gemini-99.0-argon-high' });
   f.env.FAKE_AGY_MODELS = 'gemini-3.8-argon-low\ngemini-9.0-flash-high';
-  const result = await f.run(f.start(), 'missing Hydrogen');
+  const result = await f.run(f.start(['--model', 'hydrogen']), 'missing Hydrogen');
   assert.equal(result.code, 1);
   assert.match(result.stderr, /没有可用的 Hydrogen 模型（推理档位 high）/);
   assert.equal(fs.existsSync(path.join(f.root, 'fake/calls.jsonl')), false);
@@ -2337,7 +2339,7 @@ test('Antigravity: failed models command does not use cache', async (t) => {
   const f = agyFixture(t);
   writeModelCache(f);
   f.env.FAKE_AGY_MODELS_MODE = 'fail';
-  const result = await f.run(f.start(), 'failed catalog');
+  const result = await f.run(f.start(['--model', 'hydrogen']), 'failed catalog');
   assert.equal(result.code, 1);
   assert.match(result.stderr, /agy models 失败：catalog unavailable/);
   assert.equal(fs.existsSync(path.join(f.root, 'fake/calls.jsonl')), false);
@@ -2347,7 +2349,7 @@ test('Antigravity: models times out after 20 seconds and leaves no process', asy
   const f = agyFixture(t);
   f.env.FAKE_AGY_MODELS_MODE = 'timeout';
   const begin = Date.now();
-  const result = await f.run(f.start(), 'timeout catalog');
+  const result = await f.run(f.start(['--model', 'hydrogen']), 'timeout catalog');
   assert.equal(result.code, 1);
   assert.match(result.stderr, /agy models 失败/);
   assert.ok(Date.now() - begin >= 19_000 && Date.now() - begin < 25_000);
@@ -2370,7 +2372,7 @@ test('Antigravity: explicit model bypasses lookup and PATH agy is supported', as
 
 for (const effort of ['off', 'minimal', 'extra', 'max', 'ultra']) test(`Antigravity: rejects effort ${effort}`, async (t) => {
   const f = agyFixture(t);
-  const result = await f.run(f.start(['--effort', effort]), 'invalid');
+  const result = await f.run(f.start(['--model', 'hydrogen', '--effort', effort]), 'invalid');
   assert.equal(result.code, 1);
   assert.match(result.stderr, /Antigravity --effort must be low, medium, high or xhigh/);
   assert.equal(agyModelCalls(f).length, 0);
@@ -2442,7 +2444,7 @@ test('Antigravity: missing result retries abnormal exits and preserves conversat
   assert.deepEqual(f.state().turns.map((turn) => turn.result), ['retryable', 'completed']);
   assert.match(f.state().turns[0].error, /Antigravity 异常退出（未收到 result，exit 0）：executor exited unexpectedly/);
   assert.equal(f.calls()[1].argv[f.calls()[1].argv.indexOf('--conversation') + 1], f.state().threadId);
-  assert.equal(agyModelCalls(f).length, 1);
+  assert.equal(agyModelCalls(f).length, 0);
   assert.match(f.calls()[1].prompt, /不要重做已经完成的部分/);
   const failed = agyFixture(t, 'abnormal');
   failed.env.FAKE_AGY_EXIT = '23';
@@ -2619,7 +2621,7 @@ test('Antigravity: stderr quota takes precedence over watchdog retry without a r
   assert.equal(result.code, 2);
   assert.equal(f.calls().length, 1);
   assert.equal(f.state().turns[0].result, 'fatal');
-  assert.match(f.state().error, /^Antigravity 额度用完（gemini-4-hydrogen-high）：RESOURCE_EXHAUSTED 429. Resets in 79h/);
+  assert.match(f.state().error, /^Antigravity 额度用完（gemini-pro-orchestrator）：RESOURCE_EXHAUSTED 429. Resets in 79h/);
   assert.doesNotMatch(fs.readFileSync(f.state().turns[0].files.events, 'utf8'), /"event":"result"/);
   assert.doesNotMatch(f.feed(), /次重试/);
 });
@@ -2635,7 +2637,7 @@ test('Antigravity: stderr quota takes precedence over watchdog and interrupted r
   assert.equal(state.turns[0].exit, 1);
   const events = fs.readFileSync(state.turns[0].files.events, 'utf8').trim().split('\n').map(JSON.parse);
   assert.equal(events.at(-1).result.error, 'interrupted');
-  assert.match(state.error, /^Antigravity 额度用完（gemini-4-hydrogen-high）：/);
+  assert.match(state.error, /^Antigravity 额度用完（gemini-pro-orchestrator）：/);
   assert.match(state.error, /RESOURCE_EXHAUSTED 429\. Resets in 79h/);
   assert.match(f.feed(), /没有动静.*已结束本轮/);
   assert.doesNotMatch(f.feed(), /次重试/);
@@ -2658,18 +2660,18 @@ test('Antigravity: SUCCESS result completes despite RESOURCE_EXHAUSTED in stderr
 });
 
 
-test('Antigravity: default selects newest matching Hydrogen high despite Argon and other efforts', async (t) => {
+test('Antigravity: Hydrogen keyword defaults to high and selects newest matching version despite Argon and other efforts', async (t) => {
   const f = agyFixture(t);
   f.env.FAKE_AGY_MODELS = 'gemini-4-argon-high\ngemini-4-hydrogen-high\ngemini-4.10-hydrogen-high\ngemini-4.9-hydrogen-high\ngemini-99-hydrogen-xhigh\ngemini-100-argon-high';
-  const result = await f.run(f.start(), 'latest Hydrogen');
+  const result = await f.run(f.start(['--model', 'hydrogen']), 'latest Hydrogen');
   assert.equal(result.code, 0, result.stderr);
   assert.equal(f.state().options.model, 'gemini-4.10-hydrogen-high');
   assert.match(f.feed(), /hydrogen → gemini-4.10-hydrogen-high（推理档位 high）/);
 });
 
-test('Antigravity: explicit xhigh effort resolves Hydrogen xhigh with the default model keyword', async (t) => {
+test('Antigravity: explicit Hydrogen xhigh resolves the matching model', async (t) => {
   const f = agyFixture(t);
-  const result = await f.run(f.start(['--effort', 'xhigh']), 'explicit xhigh');
+  const result = await f.run(f.start(['--model', 'hydrogen', '--effort', 'xhigh']), 'explicit xhigh');
   assert.equal(result.code, 0, result.stderr);
   assert.equal(f.state().options.effort, 'xhigh');
   assert.equal(f.state().options.model, 'gemini-4-hydrogen-xhigh');
@@ -2689,7 +2691,7 @@ test('Antigravity: send effort requires a recognizable Gemini series or an expli
   await until(() => !alive(f.state().supervisorPid));
   const result = await f.run(['send', 'task', '--effort', 'high'], 'change effort');
   assert.equal(result.code, 1);
-  assert.match(result.stderr, /改档位请同时写 --model/);
+  assert.match(result.stderr, /claude-opus-5-5-high 没有可单独指定的推理档位；要指定档位请同时写 --model hydrogen、argon 或 carbon/);
   assert.equal(agyModelCalls(f).length, 0);
   assert.equal(f.calls().length, 1);
   assert.equal((await f.run(['send', 'task', '--effort', 'high', '--model', 'argon'], 'explicit family')).code, 0);
@@ -2700,9 +2702,93 @@ test('Antigravity: quota from models fails without launching or retrying', async
   const f = agyFixture(t);
   f.env.FAKE_AGY_MODELS_MODE = 'fail';
   f.env.FAKE_AGY_STDERR = 'RESOURCE_EXHAUSTED quota';
-  const result = await f.run(f.start(), 'catalog quota');
+  const result = await f.run(f.start(['--model', 'hydrogen']), 'catalog quota');
   assert.equal(result.code, 1);
   assert.match(result.stderr, /Antigravity 额度用完：RESOURCE_EXHAUSTED quota/);
   assert.equal(agyModelCalls(f).length, 1);
   assert.equal(fs.existsSync(path.join(f.root, 'fake/calls.jsonl')), false);
+});
+
+
+test('Antigravity: Carbon keyword selects newest matching high version', async (t) => {
+  const f = agyFixture(t);
+  f.env.FAKE_AGY_MODELS = 'gemini-4-carbon-high\ngemini-4.9-carbon-high\ngemini-4.10-carbon-high\ngemini-99-carbon-low\ngemini-pro-orchestrator';
+  const result = await f.run(f.start(['--model', 'CaRbOn', '--effort', 'high']), 'Carbon');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().options.model, 'gemini-4.10-carbon-high');
+  assert.match(f.feed(), /Antigravity · gemini-4.10-carbon-high · high/);
+  assert.equal(f.agent().label, 'Antigravity：task（gemini-4.10-carbon-high · 高档推理）');
+  assert.match((await f.run(['status', 'task'])).stdout, /"effort": "high"/);
+});
+
+test('Antigravity: missing Carbon effort fails without fallback', async (t) => {
+  const f = agyFixture(t);
+  f.env.FAKE_AGY_MODELS = 'gemini-4-carbon-low\ngemini-pro-orchestrator';
+  const result = await f.run(f.start(['--model', 'carbon', '--effort', 'high']), 'missing Carbon');
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /没有可用的 Carbon 模型（推理档位 high）/);
+  assert.equal(fs.existsSync(path.join(f.root, 'fake/calls.jsonl')), false);
+});
+
+for (const [args, model] of [
+  [['--effort', 'xhigh'], 'gemini-pro-orchestrator'],
+  [['--model', 'gemini-4-hydrogen-high', '--effort', 'low'], 'gemini-4-hydrogen-high'],
+]) test(`Antigravity: start rejects effort with fixed model ${model}`, async (t) => {
+  const f = agyFixture(t);
+  const result = await f.run(f.start(args), 'invalid effort');
+  assert.equal(result.code, 1);
+  assert.ok(result.stderr.includes(`${model} 没有可单独指定的推理档位；要指定档位请同时写 --model hydrogen、argon 或 carbon`));
+  assert.equal(agyModelCalls(f).length, 0);
+  assert.equal(fs.existsSync(path.join(f.root, 'fake/calls.jsonl')), false);
+});
+
+for (const args of [
+  ['--effort', 'high'],
+  ['--model', 'gemini-4-hydrogen-high', '--effort', 'low'],
+]) test(`Antigravity: Orchestrator send rejects non-series effort ${args.join(' ')}`, async (t) => {
+  const f = agyFixture(t);
+  assert.equal((await f.run(f.start(), 'initial')).code, 0);
+  await until(() => !alive(f.state().supervisorPid));
+  const result = await f.run(['send', 'task', ...args], 'invalid effort');
+  const model = args.includes('--model') ? args[1] : 'gemini-pro-orchestrator';
+  assert.equal(result.code, 1);
+  assert.ok(result.stderr.includes(`${model} 没有可单独指定的推理档位；要指定档位请同时写 --model hydrogen、argon 或 carbon`));
+  assert.equal(f.calls().length, 1);
+  assert.equal(agyModelCalls(f).length, 0);
+  assert.equal(f.state().options.model, 'gemini-pro-orchestrator');
+});
+
+test('Antigravity: Hydrogen send effort xhigh re-resolves and displays model suffix', async (t) => {
+  const f = agyFixture(t);
+  assert.equal((await f.run(f.start(['--model', 'hydrogen']), 'initial')).code, 0);
+  await until(() => !alive(f.state().supervisorPid));
+  assert.equal((await f.run(['send', 'task', '--effort', 'xhigh'], 'change effort')).code, 0);
+  assert.equal(f.state().options.model, 'gemini-4-hydrogen-xhigh');
+  assert.equal(agyModelCalls(f).length, 2);
+  assert.match(f.feed(), /Antigravity · gemini-4-hydrogen-xhigh · xhigh/);
+  assert.equal(f.agent().label, 'Antigravity：task（gemini-4-hydrogen-xhigh · 超高档推理）');
+  assert.match((await f.run(['status', 'task'])).stdout, /"effort": "xhigh"/);
+});
+
+test('Antigravity: full model suffix determines displayed effort instead of internal default', async (t) => {
+  const f = agyFixture(t);
+  assert.equal((await f.run(f.start(['--model', 'gemini-4-carbon-low']), 'explicit low')).code, 0);
+  assert.equal(f.state().options.effort, 'high');
+  assert.match(f.feed(), /Antigravity · gemini-4-carbon-low · low/);
+  assert.equal(f.agent().label, 'Antigravity：task（gemini-4-carbon-low · 低档推理）');
+  assert.match((await f.run(['status', 'task'])).stdout, /"effort": "low"/);
+});
+
+for (const model of [undefined, 'connection-timeout-model']) test(`Antigravity: invalid model ${model ?? 'default'} is fatal without retry and preserves agy error`, async (t) => {
+  const f = agyFixture(t, 'invalid-model');
+  const result = await f.run(f.start(model ? ['--model', model] : []), 'invalid model');
+  assert.equal(result.code, 2);
+  assert.equal(f.calls().length, 1);
+  assert.equal(agyModelCalls(f).length, 0);
+  assert.equal(f.state().turns[0].result, 'fatal');
+  const expected = JSON.parse(fs.readFileSync(f.state().turns[0].files.events, 'utf8').trim()).result.error;
+  assert.equal(f.state().error, expected);
+  assert.match(fs.readFileSync(f.state().turns[0].files.stderr, 'utf8'), /error: invalid model selection/);
+  assert.equal(f.state().turns[0].exit, 1);
+  assert.doesNotMatch(f.feed(), /次重试/);
 });

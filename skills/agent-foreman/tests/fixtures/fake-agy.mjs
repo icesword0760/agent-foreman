@@ -14,7 +14,7 @@ if (argv[0] === 'models') {
     console.error(process.env.FAKE_AGY_STDERR || 'catalog unavailable');
     process.exit(1);
   }
-  console.log(process.env.FAKE_AGY_MODELS || 'gemini-4-hydrogen-high\ngemini-4-hydrogen-xhigh\ngemini-4-hydrogen-medium\ngemini-4-hydrogen-low\ngemini-4-argon-high\ngemini-4-argon-medium\ngemini-4-argon-low');
+  console.log(process.env.FAKE_AGY_MODELS || 'gemini-4-hydrogen-high\ngemini-4-hydrogen-xhigh\ngemini-4-hydrogen-medium\ngemini-4-hydrogen-low\ngemini-4-argon-high\ngemini-4-argon-medium\ngemini-4-argon-low\ngemini-4-carbon-low\ngemini-4-carbon-medium\ngemini-4-carbon-high\ngemini-4-carbon-xhigh\ngemini-pro-orchestrator\ngemini-pro-orchestrator-argon');
   process.exit(0);
 }
 let stdin = '';
@@ -28,6 +28,13 @@ fs.appendFileSync(path.join(dir, 'calls.jsonl'), JSON.stringify({ argv, prompt, 
 const emit = (ev) => console.log(JSON.stringify(ev));
 const step = (value) => emit({ event: 'step_update', step_update: value });
 const scenario = process.env.FAKE_CODEX_SCENARIO;
+if (scenario === 'invalid-model') {
+  const model = argv[argv.indexOf('--model') + 1];
+  const error = `invalid model selection (--model "${model}" --effort ""): model ${model} is not recognized as a known model or custom model in settings\nAvailable models:\n  Gemini 4 Carbon (Medium)\n  Orchestrator (Carbon)\n`;
+  emit({ event: 'result', result: { status: 'ERROR', error } });
+  console.error(`error: ${error}`);
+  process.exit(1);
+}
 emit({ event: 'init', conversation_id: thread });
 // Later init events must not replace the first conversation id.
 emit({ event: 'init', conversation_id: 'do-not-replace' });

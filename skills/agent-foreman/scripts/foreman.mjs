@@ -39,7 +39,7 @@ Exit code 8: 跟踪到期，任务继续运行。
 Options:
   FOREMAN_RUN_DIR overrides ~/.claude/agent-foreman/runs for all commands.
   --agent codex|dsh|agy (codex; start). DSH_BIN / AGY_BIN override dsh / agy from PATH.
-  agy defaults: --model hydrogen (latest matching effort; argon also accepted), --effort low|medium|high|xhigh (high).
+  agy defaults: --model gemini-pro-orchestrator (fixed; no effort levels). --model hydrogen|argon|carbon picks the newest at --effort low|medium|high|xhigh (high); --effort needs one of these.
   --ask-wait-min N (10; start/send)
   --no-watch  --watch-min N (29)  --warn-min N (3)
   --model M (sol；系列最新版，可选 best/astra/sol/terra/luna 或型号)  --effort E (high)  --idle-min N (10)  --max-min N (45)
@@ -111,6 +111,9 @@ const agentName = (state) => ({ dsh: 'DSH', agy: 'Antigravity' }[state.agent] ||
 const networkNote = (state) => state.networkSampling ? '（网络也没有数据）' : '';
 const quietDuration = (ms) => ms < 60_000 ? `${Math.floor(ms / 1000)} 秒` : `${Math.floor(ms / 60_000)} 分钟`;
 
+function displayEffort(state) {
+  return state.agent === 'agy' ? /-(low|medium|high|xhigh)$/.exec(state.options.model)?.[1] ?? null : state.options.effort;
+}
 function writeAgentStatus(state) {
   const dir = state.options.agentStatusDir;
   if (!dir) return;
@@ -142,10 +145,10 @@ function writeAgentStatus(state) {
     }
     detail = Array.from(String(detail ?? '').split(/[\r\n\u2028\u2029]/)[0]).slice(0, 120).join('');
     const id = `codex-${/^[A-Za-z0-9._-]+$/.test(state.task) ? state.task : createHash('sha1').update(state.task, 'utf8').digest('hex').slice(0, 12)}`;
-    const effort = state.options.effort;
+    const effort = displayEffort(state);
     const effortName = new Map([['off', '关闭'], ['minimal', '最低档'], ['low', '低档'], ['medium', '中档'], ['high', '高档'], ['xhigh', '超高档'], ['max', '最高档']]).get(effort) ?? effort;
     const model = state.options.model;
-    const label = `${agentName(state)}：${state.task}（${model && model !== 'best' ? `${model} · ` : ''}${effortName}推理）`;
+    const label = `${agentName(state)}：${state.task}（${model && model !== 'best' ? `${model}${effort ? ' · ' : ''}` : ''}${effort ? `${effortName}推理` : ''}）`;
     const file = path.join(dir, `${id}.json`);
     if (lastAgentStatus?.file === file && lastAgentStatus.status === status &&
         lastAgentStatus.label === label && lastAgentStatus.detail === detail && time - lastAgentStatus.time < 1000) return;
@@ -606,7 +609,7 @@ async function configureAgy(state, request, resolveSeries = false) {
   delete o.terraModel;
   if (request == null) return; // send inherits the resolved model without another catalog request.
   const series = request.toLowerCase();
-  if (!resolveSeries && !['hydrogen', 'argon'].includes(series)) { o.model = request; return; }
+  if (!resolveSeries && !['hydrogen', 'argon', 'carbon'].includes(series)) { o.model = request; return; }
   const output = await new Promise((resolve, reject) => {
     const child = execFile(AGY_BIN, ['models'], { cwd: o.cd, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' },
       (err, stdout, stderr) => {
@@ -740,7 +743,7 @@ function runTurn(state, prompt) {
   }
   activity(state, '启动中');
   state.lastActivityAt = turn.startedAt;
-  feed(state, `▶ ${state.task} 第 ${n} 轮开始（${resume ? '接续会话' : '新会话'} · ${isDsh || isAgy ? `${agentName(state)} · ` : ''}${state.options.model} · ${state.options.effort}）`);
+  feed(state, `▶ ${state.task} 第 ${n} 轮开始（${resume ? '接续会话' : '新会话'} · ${isDsh || isAgy ? `${agentName(state)} · ` : ''}${state.options.model}${displayEffort(state) ? ` · ${displayEffort(state)}` : ''}）`);
 
   // The sandbox already confines writes, and other sessions' edits would show up as false alarms.
   const gitBefore = state.options.fullAccess && state.options.gitRoot ? gitChanges(state.options.gitRoot) : null;
@@ -959,7 +962,7 @@ function runTurn(state, prompt) {
         const dshUnexpected = isDsh && !dshFinal && !spawnFailed && !failure && !lastError;
         if (isAgy) {
           const unexpected = !agyResult && !spawnFailed;
-          result = { status: spawnFailed || FATAL.test(msg) ? 'fatal' : unexpected || RETRYABLE.test(msg) ? 'retryable' : 'fatal',
+          result = { status: spawnFailed || /invalid model selection/i.test(msg) || FATAL.test(msg) ? 'fatal' : unexpected || RETRYABLE.test(msg) ? 'retryable' : 'fatal',
             error: (unexpected ? `Antigravity 异常退出（未收到 result，exit ${code ?? signal}）：${stderrTail}` : msg).slice(0, 1000) };
         } else {
           result = { status: dshFatal || FATAL.test(msg) ? 'fatal' : RETRYABLE.test(msg) || dshUnexpected ? 'retryable' : 'fatal',
@@ -1261,7 +1264,7 @@ async function main() {
     const last = s.turns.at(-1);
     let lastMsg = '';
     try { lastMsg = fs.readFileSync(last.files.last, 'utf8').slice(0, 2000); } catch { /* none yet */ }
-    console.log(JSON.stringify({ task, agent: s.agent || 'codex', model: s.options.model, effort: s.options.effort, status: s.status, alive: pidAlive(s.pid), idleSeconds: idle, threadId: s.threadId, turns: s.turns.map((t) => ({ n: t.n, result: t.result ?? 'running', error: t.error })), error: s.error }, null, 2));
+    console.log(JSON.stringify({ task, agent: s.agent || 'codex', model: s.options.model, effort: displayEffort(s), status: s.status, alive: pidAlive(s.pid), idleSeconds: idle, threadId: s.threadId, turns: s.turns.map((t) => ({ n: t.n, result: t.result ?? 'running', error: t.error })), error: s.error }, null, 2));
     if (lastMsg) console.log(`\n--- last message ---\n${lastMsg}`);
     return 0;
   }
@@ -1295,7 +1298,7 @@ async function main() {
     if (!fs.existsSync(opts.cd) || !fs.statSync(opts.cd).isDirectory()) throw new Error(`Work dir does not exist: ${opts.cd}`);
     if (fs.existsSync(statePath(task))) throw new Error(`Task ${task} already exists; use resume or pick a new name.`);
     const { brief, message, agent: _agent, ...rest } = opts;
-    state = { task, agent, createdAt: now(), status: 'new', threadId: null, pid: null, turns: [], options: { ...DEFAULTS, ...(agent === 'dsh' ? { model: 'deepseek-flash' } : agent === 'agy' ? { model: 'hydrogen', effort: 'high' } : {}), fullAccess: true, ...rest } };
+    state = { task, agent, createdAt: now(), status: 'new', threadId: null, pid: null, turns: [], options: { ...DEFAULTS, ...(agent === 'dsh' ? { model: 'deepseek-flash' } : agent === 'agy' ? { model: 'gemini-pro-orchestrator', effort: 'high' } : {}), fullAccess: true, ...rest } };
     try { state.options.gitRoot = execFileSync('git', ['-C', opts.cd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { state.options.gitRoot = null; }
     prompt = await readPrompt(brief);
   } else if (cmd === 'resume' || cmd === 'send') {
@@ -1318,9 +1321,11 @@ async function main() {
   else if (agent === 'agy') {
     let request = cmd === 'start' ? state.options.model : opts.model;
     let resolveSeries = false;
+    const effortError = () => new Error(`${state.options.model} 没有可单独指定的推理档位；要指定档位请同时写 --model hydrogen、argon 或 carbon`);
+    if (opts.effort != null && request != null && !['hydrogen', 'argon', 'carbon'].includes(request.toLowerCase())) throw effortError();
     if (cmd !== 'start' && request == null && opts.effort != null) {
       request = /^gemini-\d+(?:\.\d+)*-([a-z0-9]+(?:-[a-z0-9]+)*)-(?:low|medium|high|xhigh)$/.exec(state.options.model)?.[1];
-      if (!request) throw new Error('当前 Antigravity 型号无法识别系列；改档位请同时写 --model');
+      if (!request) throw effortError();
       resolveSeries = true;
     }
     await configureAgy(state, request, resolveSeries);

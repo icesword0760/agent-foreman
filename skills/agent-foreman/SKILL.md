@@ -12,7 +12,7 @@ description: Use whenever work is handed to another coding agent — the user sa
 - **你（Claude）**：创意方向、理解用户意图、产品取舍、审美、查清原因和定方案、验收标准、与用户沟通、看实物验收。
 - **Codex**（主力执行者）：方案定好后的一切落地，包括细节设计、编码与测试、源码阅读与调研（也包括为定方案先做的调研）、图片/媒体生成、数据处理、打包。
 - **DSH**（可选，本机装了 DSH CLI 才有）：主要做**前端 UI 设计**，包括页面和组件的视觉设计、布局、样式、交互外观，以及把它们实现成前端界面代码。用同一个脚本加 `--agent dsh` 派给它，默认 DeepSeek-V4.1-Flash + 高档推理。其他活都优先交给 Codex；Codex 任务里遇到前端 UI 设计的部分，会按运行约定自己派给 DSH 子任务。审美和验收仍由你判，流程和总把控和 Codex 完全一样。
-- **Antigravity**（可选，本机装了 agy CLI 才有）：用户点名时才派。用同一个脚本加 `--agent agy`，默认 Gemini Hydrogen 系列最新版 + 高档推理（用户点名 Argon 时加 `--model argon`）。只用选定的模型：额度用完或找不到它时任务直接失败并写明原因，不自动换模型，也不自动换执行者；你报告用户，由用户决定改派给谁。流程和总把控和 Codex 完全一样。
+- **Antigravity**（可选，本机装了 agy CLI 才有）：用户点名时才派。用同一个脚本加 `--agent agy`，默认用 Orchestrator (Carbon)（型号 `gemini-pro-orchestrator`，没有推理档位可选）；用户点名别的模型时才换，例如 `--model hydrogen` / `argon` / `carbon` 按 `--effort` 取该系列最新版。只用选定的模型：额度用完或找不到它时任务直接失败并写明原因，不自动换模型，也不自动换执行者；你报告用户，由用户决定改派给谁。流程和总把控和 Codex 完全一样。
 - 你只直接改协调性文件（项目规则、方案、交代书、技能文档）。执行者前面不加任何传话 Agent，由你直接调用监督脚本。
 
 ## 流程

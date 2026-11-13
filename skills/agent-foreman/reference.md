@@ -21,7 +21,7 @@
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `--agent` | `codex` | `dsh` 把任务派给 DSH CLI，`agy` 派给 Antigravity CLI（只在 `start` 时指定，之后的 `send` 沿用）。DSH 的 `--model` 可写 `flash`、`pro` 或完整型号，`--effort` 为 `off`/`low`/`high`/`max`。Antigravity 的 `--model` 默认 `hydrogen`（Hydrogen 系列最新版，用 `agy models` 解析），也可写 `argon` 或完整型号；`--effort` 为 `low`/`medium`/`high`/`xhigh`，默认 `high`（xhigh 只有 Hydrogen 有）；`send` 只改 `--effort` 时沿用当前系列；找不到模型或额度用完时直接失败，不重试、不换模型 |
+| `--agent` | `codex` | `dsh` 把任务派给 DSH CLI，`agy` 派给 Antigravity CLI（只在 `start` 时指定，之后的 `send` 沿用）。DSH 的 `--model` 可写 `flash`、`pro` 或完整型号，`--effort` 为 `off`/`low`/`high`/`max`。Antigravity 的 `--model` 默认 `gemini-pro-orchestrator`（Orchestrator，固定型号，没有推理档位，底栏和 ▶ 行不显示档位），也可写系列关键字 `hydrogen` / `argon` / `carbon`（用 `agy models` 解析该系列最新版）或完整型号；`--effort` 为 `low`/`medium`/`high`/`xhigh`，默认 `high`，只配合系列关键字使用，配完整型号或默认 Orchestrator 会直接报错；`send` 只改 `--effort` 时沿用当前系列；型号写错时 agy 直接拒绝，任务判失败、不重试；找不到模型或额度用完时直接失败，不重试、不换模型 |
 | `--model` / `--effort` | `sol` / `high` | Codex 默认 = 主力 sol 系列里版本最新的可用型号 + 高档推理。系列关键字 `astra`（前沿）、`sol`（主力）、`terra`（均衡）、`luna`（快速）都按「该系列最新版本」解析；`best` = 跨系列最高档（astra > sol > terra > luna，再比版本），不按目录排序。操作电脑界面的部分（computer use，含 Blender 建模）不换主模型，由脚本在运行约定里要求主 Codex 用 `spawn_agent` 派 terra 最新版子代理完成（必须带 `fork_turns="none"`，否则模型设置不生效）。`start` 时解析一次，整个任务沿用；出现不认识的系列会 ⚠ 提醒确认；该系列没有可用型号时直接报错，不自动换系列。`codex debug models` 偶尔返回过时的内置目录，脚本会记住 7 天内见过的型号，不会因此降级。显式写型号名则直接用。模型繁忙时脚本会退避重试，持续失败就报告用户 |
 | `--idle-min` | 10 | 多久没动静判定卡住，结束本轮并重试 |
 | `--warn-min` | 3 | 多久没动静先发 ⏸ 提醒 |
