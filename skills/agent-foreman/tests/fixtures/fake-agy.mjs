@@ -48,6 +48,20 @@ if (scenario === 'fatal' || (scenario === 'retry-then-ok' && count === 1)) {
   if (process.env.FAKE_AGY_HANG_ERROR) await sleep(600_000);
   process.exit(Number(process.env.FAKE_AGY_EXIT || 0));
 }
+if (scenario === 'error-with-response' || (scenario === 'malformed-empty-then-ok' && count === 1)) {
+  const response = process.env.FAKE_AGY_RESPONSE ?? (scenario === 'error-with-response'
+    ? '  假 Antigravity 回复：任务完成。\n第二行完整保留。😀\n我自己做的决定：无\n' : '');
+  for (let offset = 0; offset < response.length; offset += 16) {
+    step({ step_index: 1, state: 'ACTIVE', step_type: 'agent_response', text_delta: response.slice(offset, offset + 16) });
+  }
+  step({ step_index: 1, state: 'DONE', step_type: 'agent_response' });
+  emit({ event: 'result', result: {
+    conversation_id: thread, status: 'ERROR', response,
+    error: process.env.FAKE_AGY_ERROR || 'Your previous response contained an improperly formatted function call: Malformed function call: Failed to parse function call: Function call is empty - no input to parse.\nPlease retry with a properly formatted function call\nRetries remaining: 3',
+    duration_seconds: 1, num_turns: 3, finished_reason: 'error',
+  } });
+  process.exit(1);
+}
 step({ step_index: 1, state: 'ACTIVE', step_type: 'tool', tool_name: 'run_command', tool_info: { parameters: { CommandLine: "/bin/zsh -lc 'echo hello'" } } });
 if (scenario === 'activity') {
   const updates = [
@@ -72,9 +86,10 @@ if (scenario === 'hang' || scenario === 'network' || (scenario === 'stall-then-o
   const started = Date.now();
   process.once('SIGTERM', () => {
     if (process.env.FAKE_AGY_SILENT_SIGTERM === '1') process.exit(1);
-    console.error('error: interrupted');
+    const error = process.env.FAKE_AGY_ERROR || 'interrupted';
+    console.error(`error: ${error}`);
     process.stdout.write(JSON.stringify({ event: 'result', result: {
-      conversation_id: thread, status: 'ERROR', response: '', error: 'interrupted',
+      conversation_id: thread, status: 'ERROR', response: process.env.FAKE_AGY_RESPONSE || '', error,
       duration_seconds: (Date.now() - started) / 1000, num_turns: 1, usage: {}, finished_reason: 'interrupted',
     } }) + '\n', () => process.exit(1));
   });

@@ -781,6 +781,7 @@ function runTurn(state, prompt) {
     let completed = false;
     let dshFinal = false;
     let agyResult = false;
+    let agyHasResponse = false;
     let agyResultTimer;
     const agyResponses = new Map();
     let spawnFailed = false;
@@ -821,10 +822,12 @@ function runTurn(state, prompt) {
         } else if (ev.event === 'result' && !agyResult) {
           agyResult = true;
           completed = /^(success|completed|ok)$/i.test(ev.result?.status || '');
-          if (completed) {
-            const response = ev.result?.response;
-            fs.writeFileSync(files.last, typeof response === 'string' && response.trim() ? response : '（Antigravity 没有给出文字回复）');
-          } else {
+          const response = ev.result?.response;
+          agyHasResponse = typeof response === 'string' && Boolean(response.trim());
+          if (agyHasResponse || completed) {
+            fs.writeFileSync(files.last, agyHasResponse ? response : '（Antigravity 没有给出文字回复）');
+          }
+          if (!completed) {
             const error = ev.result?.error || ev.result?.status || 'Antigravity result without status';
             failure = typeof error === 'string' ? error : JSON.stringify(error);
           }
@@ -955,7 +958,12 @@ function runTurn(state, prompt) {
       if (isAgy && agyResult && completed) result = { status: 'completed' };
       else if (isAgy && AGY_QUOTA.test(quotaText)) result = { status: 'fatal', error: `Antigravity 额度用完（${state.options.model}）：${quotaText.trim()}` };
       else if (killedFor) result = { status: killedFor, error: `${killedFor} (watchdog)` };
-      else if (!isAgy && completed && code === 0) result = { status: 'completed' };
+      else if (isAgy && agyResult && /Malformed function call/i.test(failure)) {
+        if (agyHasResponse) {
+          feed(state, `⚠ ${state.task} Antigravity 回复末尾的工具调用格式出错，已收下它写好的回复按完成处理；如果回复显示还没做完，用 send 让它接着做`);
+          result = { status: 'completed' };
+        } else result = { status: 'retryable', error: failure.slice(0, 1000) };
+      } else if (!isAgy && completed && code === 0) result = { status: 'completed' };
       else {
         let stderrTail = '';
         try { stderrTail = fs.readFileSync(files.stderr, 'utf8').split('\n').filter((l) => !/failed to load skill/.test(l)).slice(-15).join('\n'); } catch { /* none */ }

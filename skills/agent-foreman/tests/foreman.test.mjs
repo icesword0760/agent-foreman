@@ -2461,6 +2461,96 @@ for (const scenario of ['empty', 'no-newline']) test(`Antigravity: ${scenario} r
   assert.equal(/缺少「我自己做的决定」/.test(f.feed()), scenario === 'empty');
 });
 
+test('Antigravity: malformed function call with response completes without retry and preserves the reply', async (t) => {
+  const f = agyFixture(t, 'error-with-response');
+  const result = await f.run(f.start(), 'keep completed report');
+  assert.equal(result.code, 0, result.stderr);
+  const state = f.state();
+  assert.equal(state.status, 'completed');
+  assert.equal(state.exitCode, 0);
+  assert.equal(state.error, null);
+  assert.deepEqual(state.turns.map((turn) => turn.result), ['completed']);
+  assert.equal(state.turns[0].exit, 1);
+  const events = fs.readFileSync(state.turns[0].files.events, 'utf8').trim().split('\n').map(JSON.parse);
+  const response = events.at(-1).result.response;
+  assert.equal(events.at(-2).step_update.state, 'DONE');
+  assert.equal(events.at(-1).result.status, 'ERROR');
+  assert.equal(events.at(-1).result.finished_reason, 'error');
+  assert.equal(fs.readFileSync(state.turns[0].files.last, 'utf8'), response);
+  const warning = '⚠ task Antigravity 回复末尾的工具调用格式出错，已收下它写好的回复按完成处理；如果回复显示还没做完，用 send 让它接着做';
+  const feed = f.feed();
+  assert.ok(feed.includes(warning));
+  assert.match(feed, /✅ task 本轮完成/);
+  assert.ok(feed.indexOf(warning) < feed.indexOf('✅ task'));
+  assert.ok(feed.includes(response));
+  assert.ok(result.stdout.includes(response));
+  assert.doesNotMatch(feed, /次重试|❌/);
+  assert.equal(f.calls().length, 1);
+});
+
+for (const response of ['', ' \n\t']) test(`Antigravity: malformed function call with empty response ${JSON.stringify(response)} retries once`, async (t) => {
+  const f = agyFixture(t, 'malformed-empty-then-ok');
+  f.env.FAKE_AGY_RESPONSE = response;
+  f.env.FAKE_AGY_ERROR = 'malformed FUNCTION CALL: Function call is empty - no input to parse.';
+  const result = await f.run(f.start(), 'retry missing report');
+  assert.equal(result.code, 0, result.stderr);
+  const state = f.state();
+  assert.equal(state.status, 'completed');
+  assert.deepEqual(state.turns.map((turn) => turn.result), ['retryable', 'completed']);
+  assert.equal(fs.existsSync(state.turns[0].files.last), false);
+  assert.equal(f.calls().length, 2);
+  assert.equal(f.calls()[1].thread, f.calls()[0].thread);
+  assert.match(f.calls()[1].prompt, /不要重做已经完成的部分/);
+  assert.equal((f.feed().match(/第 1\/1 次重试/g) || []).length, 1);
+  assert.doesNotMatch(f.feed(), /已收下它写好的回复/);
+  assert.match(f.feed(), /✅ task 本轮完成（第 2 轮/);
+});
+
+test('Antigravity: other fatal result with response still fails and publishes the reply', async (t) => {
+  const f = agyFixture(t, 'error-with-response');
+  f.env.FAKE_AGY_ERROR = 'unknown error';
+  const result = await f.run(f.start(), 'keep failed report');
+  assert.equal(result.code, 2, result.stderr);
+  const state = f.state();
+  assert.equal(state.status, 'failed');
+  assert.deepEqual(state.turns.map((turn) => turn.result), ['fatal']);
+  assert.equal(state.error, 'unknown error');
+  const response = JSON.parse(fs.readFileSync(state.turns[0].files.events, 'utf8').trim().split('\n').at(-1)).result.response;
+  assert.equal(fs.readFileSync(state.turns[0].files.last, 'utf8'), response);
+  assert.match(f.feed(), /❌ task 失败：unknown error/);
+  assert.ok(f.feed().includes(response));
+  assert.ok(result.stdout.includes(response));
+  assert.doesNotMatch(f.feed(), /已收下它写好的回复|✅|次重试/);
+  assert.equal(f.calls().length, 1);
+});
+
+test('Antigravity: quota takes precedence over malformed function call with response', async (t) => {
+  const f = agyFixture(t, 'error-with-response');
+  f.env.FAKE_AGY_STDERR = 'RESOURCE_EXHAUSTED 429. Resets in 79h';
+  assert.equal((await f.run(f.start(), 'quota before malformed')).code, 2);
+  assert.equal(f.state().turns[0].result, 'fatal');
+  assert.match(f.state().error, /^Antigravity 额度用完/);
+  assert.match(f.feed(), /假 Antigravity 回复：任务完成/);
+  assert.doesNotMatch(f.feed(), /已收下它写好的回复|✅|次重试/);
+  assert.equal(f.calls().length, 1);
+});
+
+for (const [status, flags, code] of [
+  ['timeout', ['--max-min', '0.01'], 4],
+  ['stalled', ['--idle-min', '0.01', '--warn-min', '0.005'], 3],
+]) test(`Antigravity: watchdog ${status} takes precedence over malformed function call with response`, async (t) => {
+  const f = agyFixture(t, 'hang');
+  f.env.FAKE_AGY_ERROR = 'Malformed function call: Function call is empty - no input to parse.';
+  f.env.FAKE_AGY_RESPONSE = '看门狗停下时的回复\n我自己做的决定：无';
+  assert.equal((await f.run(f.start([...flags, '--retries', '0']), 'watchdog before malformed')).code, code);
+  const turn = f.state().turns[0];
+  assert.equal(turn.result, status);
+  assert.equal(turn.error, `${status} (watchdog)`);
+  assert.equal(fs.readFileSync(turn.files.last, 'utf8'), f.env.FAKE_AGY_RESPONSE);
+  assert.doesNotMatch(f.feed(), /已收下它写好的回复|✅|次重试/);
+  assert.equal(f.calls().length, 1);
+});
+
 for (const status of ['success', 'CoMpLeTeD', 'ok']) test(`Antigravity: result ${status} succeeds regardless of exit code`, async (t) => {
   const f = agyFixture(t);
   f.env.FAKE_AGY_STATUS = status;
@@ -2625,7 +2715,7 @@ test('Antigravity: nonblocking question and timeout events use the display name'
   const f = agyFixture(t, 'hang');
   assert.equal((await f.run(f.start(['--no-watch']), 'questions')).code, 0);
   assert.equal((await f.run(['ask', 'task', '--no-wait'], '继续吗')).code, 0);
-  await until(() => /不阻塞，Antigravity/.test(f.feed()));
+  await until(() => fs.existsSync(path.join(f.runs, 'task/feed.log')) && /不阻塞，Antigravity/.test(f.feed()));
   await f.run(['ask', 'task', '--wait-min', '0.005'], '等不到回答');
   await until(() => /Antigravity 按约定处理/.test(f.feed()));
 });
