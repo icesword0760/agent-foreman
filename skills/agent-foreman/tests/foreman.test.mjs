@@ -2242,6 +2242,18 @@ function agyModelCalls(f) {
   return fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse) : [];
 }
 
+function assertAgyOrchestratorProtocol(prompt, dir) {
+  assert.doesNotMatch(prompt, /也不要派生子 Agent|不要派生子代理（browser_subagent/);
+  assert.ok(prompt.includes('- 不要使用 agent-foreman 技能，不要再启动 codex。\n'));
+  assert.ok(prompt.includes(`- 可以按需要派子代理（define_subagent、invoke_subagent 等）并行做，一两步就能做完的活自己做。派子代理时，防止意图在转述中丢失：交代开头写明「先读完原始交代 ${dir}/run-*.prompt.md（按序号全部读完），其中的用户意图、已定的决定和范围同样约束你」，再写这次交给它的具体部分和要交回的东西；要求它每完成一步向 ${path.join(dir, 'progress.log')} 追加一行「时间 子代理名 步骤 结果」，只在工作目录内写文件，遇到要确认的问题交回给你、不要用 ask_question，并交回自己做的决定。它交回后，你先对照原始交代里的用户意图检查有没有偏，再整合；它做的决定要并入你最终回复的「我自己做的决定」，注明来自哪个子代理。`));
+}
+
+function assertAgyNoSubagentsProtocol(prompt) {
+  assert.ok(prompt.includes('- 不要使用 agent-foreman 技能，不要再启动 codex，也不要派生子 Agent。\n'));
+  assert.ok(prompt.includes('- 不要派生子代理（browser_subagent、invoke_subagent、define_subagent 等），全部自己做。'));
+  assert.doesNotMatch(prompt, /可以按需要派子代理/);
+}
+
 test('Antigravity: default launch uses fixed Orchestrator without catalog lookup, records init, streams reply and publishes display name', async (t) => {
   const f = agyFixture(t);
   writeConfig(f, 'model_instructions_file = "/must-not-affect-agy"\n');
@@ -2262,12 +2274,11 @@ test('Antigravity: default launch uses fixed Orchestrator without catalog lookup
   assert.equal(fs.realpathSync(call.cwd), fs.realpathSync(f.root));
   assert.ok(call.prompt.startsWith('AGY brief\n全文保留\n\n---'));
   assert.doesNotMatch(call.prompt, /派任何子代理|前端 UI 设计的部分|terra|spawn_agent|computer use/);
+  assertAgyOrchestratorProtocol(call.prompt, path.join(f.runs, 'task'));
   for (const text of [
     `工作目录（也就是当前目录）是 ${f.root}，交代里的相对路径都按它算；运行目录 ${path.join(f.runs, 'task')} 只用来写进度、日志和决定清单。`,
     '提问一律用上面的 ask 命令，不要用 ask_question 工具：这里没有人能在界面上回答它。',
     'ask 命令会一直等到有回答，最长 7 分钟。', '用 command_status 等它结束、拿到输出里的回答后再继续，不要没等到就往下做。',
-    '不要派生子代理（browser_subagent、invoke_subagent、define_subagent 等），全部自己做。',
-    '不要使用 agent-foreman 技能，不要再启动 codex，也不要派生子 Agent。',
     ' ask task', ' inbox task', 'progress.log', 'decisions.md',
   ]) assert.ok(call.prompt.includes(text), text);
   const reply = '假 Antigravity 回复：任务完成。\n第二行完整保留。\n我自己做的决定：无';
@@ -2281,6 +2292,39 @@ test('Antigravity: default launch uses fixed Orchestrator without catalog lookup
   assert.equal(f.agent().state, 'completed');
   assert.match((await f.run(['watch', 'task'])).stdout, /--- Antigravity 回复 ---/);
   assert.match((await f.run(['status', 'task'])).stdout, /"agent": "agy"/);
+});
+
+for (const model of ['gemini-pro-orchestrator-argon', 'GeMiNi-PrO-OrChEsTrAtOr']) {
+  test(`Antigravity: Orchestrator protocol allows subagents for ${model}`, async (t) => {
+    const f = agyFixture(t);
+    const result = await f.run(f.start(['--model', model]), 'delegate work');
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(f.state().options.model, model);
+    assertAgyOrchestratorProtocol(f.calls()[0].prompt, path.join(f.runs, 'task'));
+  });
+}
+
+for (const model of ['hydrogen', 'argon', 'carbon', 'gemini-4-carbon-low']) {
+  test(`Antigravity: non-Orchestrator protocol keeps both subagent bans for ${model}`, async (t) => {
+    const f = agyFixture(t);
+    const result = await f.run(f.start(['--model', model]), 'work directly');
+    assert.equal(result.code, 0, result.stderr);
+    assertAgyNoSubagentsProtocol(f.calls()[0].prompt);
+  });
+}
+
+test('Antigravity: send model override restores both subagent bans after Orchestrator', async (t) => {
+  const f = agyFixture(t);
+  assert.equal((await f.run(f.start(), 'initial')).code, 0);
+  assertAgyOrchestratorProtocol(f.calls()[0].prompt, path.join(f.runs, 'task'));
+  await until(() => !alive(f.state().supervisorPid));
+  const threadId = f.state().threadId;
+  const result = await f.run(['send', 'task', '--model', 'hydrogen'], 'work directly now');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().options.model, 'gemini-4-hydrogen-high');
+  assert.equal(f.state().threadId, threadId);
+  assert.equal(f.calls().length, 2);
+  assertAgyNoSubagentsProtocol(f.calls()[1].prompt);
 });
 
 for (const command of ['send', 'resume']) test(`Antigravity: ${command} inherits conversation/model and resolves only explicit overrides`, async (t) => {

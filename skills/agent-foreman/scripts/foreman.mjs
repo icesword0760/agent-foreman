@@ -383,6 +383,8 @@ function dshAvailable(cwd) {
 // Appended to every prompt so each brief does not have to restate the run protocol.
 function protocolFooter(state) {
   const dir = runDir(state.task);
+  const progress = path.join(dir, 'progress.log');
+  const isAgyOrchestrator = state.agent === 'agy' && /orchestrator/i.test(state.options.model ?? '');
   const askWaitMin = state.options.askWaitMin ?? DEFAULTS.askWaitMin;
   return `
 
@@ -390,7 +392,7 @@ function protocolFooter(state) {
 ## 运行约定（由监督脚本附加）
 - 你是执行者，负责把本任务交代的目标落地。创意方向、产品取舍和审美以交代为准；交代没写到、又会影响用户看到的结果或产品走向的地方，先提问，不要自行发挥。
 - 交代没提到、做的过程中却发现必须新加存储、依赖或抽象，改核心结构或接口，或者做不可逆的迁移时，先提问：说明为什么需要、有没有更简单的做法，得到回答再动手。
-- 不要使用 agent-foreman 技能，不要再启动 codex${state.agent !== 'agy' && state.options.terraModel ? '；只允许下述 terra 界面操作子代理，不要派生其他子 Agent。' : '，也不要派生子 Agent。'}
+- 不要使用 agent-foreman 技能，不要再启动 codex${isAgyOrchestrator ? '。' : state.agent !== 'agy' && state.options.terraModel ? '；只允许下述 terra 界面操作子代理，不要派生其他子 Agent。' : '，也不要派生子 Agent。'}
 - 需要的工具（如某个 MCP 服务）一开始没出现时，先等 30 秒再查一次，仍然没有才算没有；不要一看不到就下结论或改用别的办法。
 - 只在工作目录 ${state.options.cd} 内写文件${state.options.addDirs.length ? `（另允许：${state.options.addDirs.join('、')}）` : ''}；不要修改其他位置，不要执行 git push；只有交代书明确要求时才 git commit，并且只提交到交代书指定的分支。
 - 提问：遇到必须先确认才能继续的问题，运行下面的命令（把命令超时设为 ${askWaitMin + 5} 分钟，即 ${(askWaitMin + 5) * 60_000} 毫秒）：
@@ -400,7 +402,7 @@ function protocolFooter(state) {
   它会等待回答，最长 ${askWaitMin} 分钟。拿到回答后按回答继续；等不到回答时按命令打印的说明处理。
 - 不影响继续工作的问题，在同一命令后加 --no-wait，写明你先按哪种做法进行，然后继续工作。
 - 每完成一个步骤，运行 FOREMAN_RUN_DIR="${RUNS}" node "${SCRIPT}" inbox ${shellTask(state.task)}，查看有没有新的回答或留言，有就照办。
-- 进度：每完成一个步骤，向 ${path.join(dir, 'progress.log')} 追加一行「时间 步骤 结果」。
+- 进度：每完成一个步骤，向 ${progress} 追加一行「时间 步骤 结果」。
 - 长命令（安装、渲染、录屏等超过 1 分钟的命令）把输出 tee 到 ${path.join(dir, 'logs')}/ 下的日志文件，例如 \`cmd 2>&1 | tee ${path.join(dir, 'logs')}/render.log\`。
 - 自己做的取舍随时追加到 ${path.join(dir, 'decisions.md')}，每条写清决定和理由。
 - 到达交代中写明的关卡时停下。最终回复依次写：完成了什么、产物路径、自检结果、「我自己做的决定」（逐条列出，没有就写「无」）、未解决的问题。不要越过关卡继续做。${['dsh', 'agy'].includes(state.agent) ? '' : `
@@ -414,7 +416,7 @@ function protocolFooter(state) {
 - 工作目录（也就是当前目录）是 ${state.options.cd}，交代里的相对路径都按它算；运行目录 ${dir} 只用来写进度、日志和决定清单。
 - 提问一律用上面的 ask 命令，不要用 ask_question 工具：这里没有人能在界面上回答它。
 - ask 命令会一直等到有回答，最长 ${askWaitMin} 分钟。它如果被转到后台运行，用 command_status 等它结束、拿到输出里的回答后再继续，不要没等到就往下做。
-- 不要派生子代理（browser_subagent、invoke_subagent、define_subagent 等），全部自己做。` : ''}`;
+${isAgyOrchestrator ? `- 可以按需要派子代理（define_subagent、invoke_subagent 等）并行做，一两步就能做完的活自己做。派子代理时，防止意图在转述中丢失：交代开头写明「先读完原始交代 ${dir}/run-*.prompt.md（按序号全部读完），其中的用户意图、已定的决定和范围同样约束你」，再写这次交给它的具体部分和要交回的东西；要求它每完成一步向 ${progress} 追加一行「时间 子代理名 步骤 结果」，只在工作目录内写文件，遇到要确认的问题交回给你、不要用 ask_question，并交回自己做的决定。它交回后，你先对照原始交代里的用户意图检查有没有偏，再整合；它做的决定要并入你最终回复的「我自己做的决定」，注明来自哪个子代理。` : '- 不要派生子代理（browser_subagent、invoke_subagent、define_subagent 等），全部自己做。'}` : ''}`;
 
 }
 
