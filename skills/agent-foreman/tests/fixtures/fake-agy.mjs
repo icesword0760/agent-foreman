@@ -61,7 +61,18 @@ if (scenario === 'network') {
   const worker = spawn(process.execPath, ['-e', 'const parent = process.ppid; setInterval(() => { if (process.ppid !== parent) process.exit(0); }, 100)'], { stdio: 'ignore' });
   fs.writeFileSync(path.join(dir, 'worker.pid'), String(worker.pid));
 }
-if (scenario === 'hang' || scenario === 'network' || (scenario === 'stall-then-ok' && count === 1)) await sleep(600_000);
+if (scenario === 'hang' || scenario === 'network' || (scenario === 'stall-then-ok' && count === 1)) {
+  const started = Date.now();
+  process.once('SIGTERM', () => {
+    if (process.env.FAKE_AGY_SILENT_SIGTERM === '1') process.exit(1);
+    console.error('error: interrupted');
+    process.stdout.write(JSON.stringify({ event: 'result', result: {
+      conversation_id: thread, status: 'ERROR', response: '', error: 'interrupted',
+      duration_seconds: (Date.now() - started) / 1000, num_turns: 1, usage: {}, finished_reason: 'interrupted',
+    } }) + '\n', () => process.exit(1));
+  });
+  await sleep(600_000);
+}
 let response = '假 Antigravity 回复：任务完成。\n第二行完整保留。\n我自己做的决定：无';
 if (scenario === 'ask-protocol') {
   const ask = prompt.match(/^  (FOREMAN_RUN_DIR=.* node .* ask .*?) <<'EOF'$/m)?.[1];

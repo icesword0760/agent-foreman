@@ -39,7 +39,7 @@ Exit code 8: 跟踪到期，任务继续运行。
 Options:
   FOREMAN_RUN_DIR overrides ~/.claude/agent-foreman/runs for all commands.
   --agent codex|dsh|agy (codex; start). DSH_BIN / AGY_BIN override dsh / agy from PATH.
-  agy defaults: --model hydrogen (latest matching effort; argon also accepted), --effort low|medium|high|xhigh (xhigh).
+  agy defaults: --model hydrogen (latest matching effort; argon also accepted), --effort low|medium|high|xhigh (high).
   --ask-wait-min N (10; start/send)
   --no-watch  --watch-min N (29)  --warn-min N (3)
   --model M (sol；系列最新版，可选 best/astra/sol/terra/luna 或型号)  --effort E (high)  --idle-min N (10)  --max-min N (45)
@@ -286,6 +286,7 @@ function finalText(state) {
   let text;
   if (state.status === 'completed') text = `✅ ${task} 本轮完成（第 ${last.n} 轮，用时 ${duration(Date.parse(last.endedAt) - Date.parse(last.startedAt))}）`;
   else if (state.status === 'stopped') text = `■ ${task} 已手动停止`;
+  else if (state.status === 'timeout') text = `⏱ ${task} 超时停下，等待处理（不算失败；用 send 让它从断点接着做）`;
   else text = `❌ ${task} 失败：${short(state.error, 1000)}`;
   let reply = '';
   try { reply = fs.readFileSync(last.files.last, 'utf8'); } catch { /* no reply */ }
@@ -948,7 +949,7 @@ function runTurn(state, prompt) {
       let result;
       if (isAgy && agyResult && completed) result = { status: 'completed' };
       else if (isAgy && AGY_QUOTA.test(quotaText)) result = { status: 'fatal', error: `Antigravity 额度用完（${state.options.model}）：${quotaText.trim()}` };
-      else if (killedFor && !(isAgy && agyResult)) result = { status: killedFor, error: `${killedFor} (watchdog)` };
+      else if (killedFor) result = { status: killedFor, error: `${killedFor} (watchdog)` };
       else if (!isAgy && completed && code === 0) result = { status: 'completed' };
       else {
         let stderrTail = '';
@@ -1294,7 +1295,7 @@ async function main() {
     if (!fs.existsSync(opts.cd) || !fs.statSync(opts.cd).isDirectory()) throw new Error(`Work dir does not exist: ${opts.cd}`);
     if (fs.existsSync(statePath(task))) throw new Error(`Task ${task} already exists; use resume or pick a new name.`);
     const { brief, message, agent: _agent, ...rest } = opts;
-    state = { task, agent, createdAt: now(), status: 'new', threadId: null, pid: null, turns: [], options: { ...DEFAULTS, ...(agent === 'dsh' ? { model: 'deepseek-flash' } : agent === 'agy' ? { model: 'hydrogen', effort: 'xhigh' } : {}), fullAccess: true, ...rest } };
+    state = { task, agent, createdAt: now(), status: 'new', threadId: null, pid: null, turns: [], options: { ...DEFAULTS, ...(agent === 'dsh' ? { model: 'deepseek-flash' } : agent === 'agy' ? { model: 'hydrogen', effort: 'high' } : {}), fullAccess: true, ...rest } };
     try { state.options.gitRoot = execFileSync('git', ['-C', opts.cd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { state.options.gitRoot = null; }
     prompt = await readPrompt(brief);
   } else if (cmd === 'resume' || cmd === 'send') {
