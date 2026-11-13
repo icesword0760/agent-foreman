@@ -39,7 +39,7 @@ Exit code 8: 跟踪到期，任务继续运行。
 Options:
   FOREMAN_RUN_DIR overrides ~/.claude/agent-foreman/runs for all commands.
   --agent codex|dsh|agy (codex; start). DSH_BIN / AGY_BIN override dsh / agy from PATH.
-  agy defaults: --model argon (latest matching effort), --effort low|medium|high (high).
+  agy defaults: --model hydrogen (latest matching effort; argon also accepted), --effort low|medium|high|xhigh (xhigh).
   --ask-wait-min N (10; start/send)
   --no-watch  --watch-min N (29)  --warn-min N (3)
   --model M (sol；系列最新版，可选 best/astra/sol/terra/luna 或型号)  --effort E (high)  --idle-min N (10)  --max-min N (45)
@@ -598,29 +598,30 @@ function buildDshArgs(state, resume) {
   return [...args, '-'];
 }
 
-async function configureAgy(state, request) {
+async function configureAgy(state, request, resolveSeries = false) {
   const o = state.options;
-  if (!['low', 'medium', 'high'].includes(o.effort)) throw new Error('Antigravity --effort must be low, medium or high');
+  if (!['low', 'medium', 'high', 'xhigh'].includes(o.effort)) throw new Error('Antigravity --effort must be low, medium, high or xhigh');
   delete o.modelRequest;
   delete o.terraModel;
   if (request == null) return; // send inherits the resolved model without another catalog request.
-  if (request.toLowerCase() !== 'argon') { o.model = request; return; }
+  const series = request.toLowerCase();
+  if (!resolveSeries && !['hydrogen', 'argon'].includes(series)) { o.model = request; return; }
   const output = await new Promise((resolve, reject) => {
     const child = execFile(AGY_BIN, ['models'], { cwd: o.cd, encoding: 'utf8', timeout: 20_000, killSignal: 'SIGKILL' },
       (err, stdout, stderr) => {
         if (!err) return resolve(stdout);
         const error = stderr?.trim() || err.message;
-        reject(new Error(`${AGY_QUOTA.test(error) ? 'Argon 额度用完：' : 'agy models 失败：'}${error}`));
+        reject(new Error(`${AGY_QUOTA.test(error) ? 'Antigravity 额度用完：' : 'agy models 失败：'}${error}`));
       });
     child.stdin.end();
   });
-  const models = [...output.matchAll(/\bgemini-(\d+(?:\.\d+)*)-argon-(low|medium|high)\b/g)]
-    .filter((match) => match[2] === o.effort)
+  const models = [...output.matchAll(/\bgemini-(\d+(?:\.\d+)*)-([a-z0-9]+(?:-[a-z0-9]+)*)-(low|medium|high|xhigh)\b/g)]
+    .filter((match) => match[2] === series && match[3] === o.effort)
     .map((match) => ({ slug: match[0], version: match[1] }))
     .sort(compareModelVersions);
-  if (!models.length) throw new Error(`没有可用的 Argon 模型（推理档位 ${o.effort}）`);
+  if (!models.length) throw new Error(`没有可用的 ${series[0].toUpperCase() + series.slice(1)} 模型（推理档位 ${o.effort}）`);
   o.model = models[0].slug;
-  feed(state, `argon → ${o.model}（推理档位 ${o.effort}）`);
+  feed(state, `${series} → ${o.model}（推理档位 ${o.effort}）`);
 }
 function buildAgyArgs(state, prompt, resume) {
   const args = ['-p', prompt, '--model', state.options.model, '--output-format', 'stream-json',
@@ -946,7 +947,7 @@ function runTurn(state, prompt) {
       }
       let result;
       if (isAgy && agyResult && completed) result = { status: 'completed' };
-      else if (isAgy && AGY_QUOTA.test(quotaText)) result = { status: 'fatal', error: `Argon 额度用完：${quotaText.trim()}` };
+      else if (isAgy && AGY_QUOTA.test(quotaText)) result = { status: 'fatal', error: `Antigravity 额度用完（${state.options.model}）：${quotaText.trim()}` };
       else if (killedFor && !(isAgy && agyResult)) result = { status: killedFor, error: `${killedFor} (watchdog)` };
       else if (!isAgy && completed && code === 0) result = { status: 'completed' };
       else {
@@ -1293,7 +1294,7 @@ async function main() {
     if (!fs.existsSync(opts.cd) || !fs.statSync(opts.cd).isDirectory()) throw new Error(`Work dir does not exist: ${opts.cd}`);
     if (fs.existsSync(statePath(task))) throw new Error(`Task ${task} already exists; use resume or pick a new name.`);
     const { brief, message, agent: _agent, ...rest } = opts;
-    state = { task, agent, createdAt: now(), status: 'new', threadId: null, pid: null, turns: [], options: { ...DEFAULTS, ...(agent === 'dsh' ? { model: 'deepseek-flash' } : agent === 'agy' ? { model: 'argon' } : {}), fullAccess: true, ...rest } };
+    state = { task, agent, createdAt: now(), status: 'new', threadId: null, pid: null, turns: [], options: { ...DEFAULTS, ...(agent === 'dsh' ? { model: 'deepseek-flash' } : agent === 'agy' ? { model: 'hydrogen', effort: 'xhigh' } : {}), fullAccess: true, ...rest } };
     try { state.options.gitRoot = execFileSync('git', ['-C', opts.cd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { state.options.gitRoot = null; }
     prompt = await readPrompt(brief);
   } else if (cmd === 'resume' || cmd === 'send') {
@@ -1313,7 +1314,16 @@ async function main() {
   fs.mkdirSync(path.join(runDir(task), 'logs'), { recursive: true });
   const offset = feedSize(task);
   if (agent === 'dsh') configureDsh(state);
-  else if (agent === 'agy') await configureAgy(state, cmd === 'start' ? state.options.model : opts.model ?? (opts.effort != null ? 'argon' : undefined));
+  else if (agent === 'agy') {
+    let request = cmd === 'start' ? state.options.model : opts.model;
+    let resolveSeries = false;
+    if (cmd !== 'start' && request == null && opts.effort != null) {
+      request = /^gemini-\d+(?:\.\d+)*-([a-z0-9]+(?:-[a-z0-9]+)*)-(?:low|medium|high|xhigh)$/.exec(state.options.model)?.[1];
+      if (!request) throw new Error('当前 Antigravity 型号无法识别系列；改档位请同时写 --model');
+      resolveSeries = true;
+    }
+    await configureAgy(state, request, resolveSeries);
+  }
   else {
     // Share the live catalog, including a failed request, across both resolutions.
     let catalog;

@@ -14,7 +14,7 @@ if (argv[0] === 'models') {
     console.error(process.env.FAKE_AGY_STDERR || 'catalog unavailable');
     process.exit(1);
   }
-  console.log(process.env.FAKE_AGY_MODELS || 'gemini-3.8-argon-high\ngemini-3.8-argon-medium\ngemini-3.8-argon-low');
+  console.log(process.env.FAKE_AGY_MODELS || 'gemini-4-hydrogen-high\ngemini-4-hydrogen-xhigh\ngemini-4-hydrogen-medium\ngemini-4-hydrogen-low\ngemini-4-argon-high\ngemini-4-argon-medium\ngemini-4-argon-low');
   process.exit(0);
 }
 let stdin = '';
