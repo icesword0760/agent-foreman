@@ -78,6 +78,9 @@ if (scenario === 'fatal' || (scenario === 'retry-then-ok' && count === 1)) {
     reply = `按回答完成：${answer}\n我自己做的决定：无`;
   }
   if (scenario === 'decisions') reply += '\n我自己做的决定：无';
+  if (scenario === 'storage-recovery') {
+    while (!fs.existsSync(process.env.FAKE_COMPLETE_FILE)) { item('reasoning'); await sleep(100); }
+  }
   if (scenario === 'delayed-ok') await sleep(2000);
   if (scenario === 'scope-change') {
     fs.writeFileSync(path.join(process.env.FAKE_SCOPE_ROOT, 'outside', `turn-${count}.txt`), 'outside change');

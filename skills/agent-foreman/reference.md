@@ -55,6 +55,7 @@
 ## 已知坑
 
 - **Monitor 到期不会连带结束任务**：`start`/`send` 经中间进程两级启动监督进程，由系统托管，Monitor 只结束跟踪那一层。万一遇到退出码 6，用 `stop` 清理，再 `send` 让它从中断处继续，工作区改动和会话都保留。
+- **监工进程被强杀或崩溃后不会一直显示「运行中」**：下一次 `status`/`watch`/`send`/`resume`/`stop` 发现「状态还在运行、进程却都不在」时，会自动把它改成失败并注明「监工进程意外退出（未留下结束状态）」，`watch` 仍然返回 6。监工自己遇到未捕获异常也会先写下失败状态再退出。磁盘写满这类写盘失败不再把监工带走：状态暂存内存，恢复后自动补写（feed 里会各有一条提示）。
 - 脚本会加载你的 Codex 配置（MCP 工具服务、插件、记忆、钩子），让 Codex 和你直接使用时能力一致；连不上的个别服务只在日志里记错误，不影响工作。另外固定加 `--skip-git-repo-check`（工作目录不在 git 仓库也能跑）、`--disable unbounded_connection_retries`（断线直接报错，由监工重试）和 `service_tier`。配置里如果设置了自定义指令文件 `model_instructions_file`，监工拒绝派活，先去掉那一行。
 - 加了 `--sandbox` 的任务：`ps` 被拒绝，监听端口报 `listen EPERM`，Chromium/Electron 启动失败，`git add` 报 `.git/index.lock: Operation not permitted`，工作目录下的 `.agents/` 只读。遇到就去掉 `--sandbox`。
 - Codex 会清理每条命令的进程组，它用 `nohup … &` 起的常驻服务会被结束。需要常驻的服务由你在外面用后台 Bash 启动，执行者只负责连接。

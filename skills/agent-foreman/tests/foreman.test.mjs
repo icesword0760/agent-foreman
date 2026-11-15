@@ -2969,3 +2969,233 @@ for (const model of [undefined, 'connection-timeout-model']) test(`Antigravity: 
   assert.equal(f.state().turns[0].exit, 1);
   assert.doesNotMatch(f.feed(), /次重试/);
 });
+
+// Crash safety: real permissions, real supervisor death, and deterministic I/O faults.
+for (const recovery of ['during supervision', 'during finalization']) {
+  test(`crash safety: read-only state and feed recover ${recovery}`, { skip: process.getuid?.() === 0 }, async (t) => {
+    const f = fixture(t, 'storage-recovery');
+    f.env.FAKE_COMPLETE_FILE = path.join(f.root, 'complete');
+    assert.equal((await f.run(f.start(['--no-watch', '--idle-min', '0.5']), 'storage test')).code, 0);
+    await until(() => f.state().threadId && f.state().pid);
+    const dir = path.join(f.runs, 'task');
+    const feed = path.join(dir, 'feed.log');
+    const supervisor = f.state().supervisorPid;
+    fs.writeFileSync(path.join(dir, 'turn-1.last.txt'), '');
+    const before = fs.readFileSync(path.join(dir, 'state.json'), 'utf8');
+    fs.chmodSync(feed, 0o400);
+    fs.chmodSync(dir, 0o500);
+    try {
+      assert.throws(() => fs.writeFileSync(path.join(dir, 'state.json.tmp'), ''), { code: 'EACCES' });
+      assert.throws(() => fs.appendFileSync(feed, ''), { code: 'EACCES' });
+      await sleep(1200); // Several event, poll and mailbox saves must all survive.
+      assert.equal(alive(supervisor), true);
+      assert.equal(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'), before);
+      if (recovery === 'during finalization') {
+        fs.writeFileSync(f.env.FAKE_COMPLETE_FILE, 'done');
+        await until(() => fs.readFileSync(path.join(dir, 'supervisor.log'), 'utf8').includes('ended: completed'));
+        await sleep(200);
+        assert.equal(alive(supervisor), true, 'supervisor should be retrying final persistence');
+      }
+    } finally {
+      fs.chmodSync(dir, 0o700);
+      fs.chmodSync(feed, 0o600);
+    }
+    await until(() => f.feed().includes('状态已补写'));
+    if (recovery === 'during supervision') {
+      assert.equal(f.state().status, 'running');
+      assert.notEqual(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'), before);
+      fs.writeFileSync(f.env.FAKE_COMPLETE_FILE, 'done');
+    }
+    const result = await f.run(['watch', 'task']);
+    assert.equal(result.code, 0, result.stderr);
+    await until(() => !alive(supervisor));
+    const state = f.state();
+    assert.equal(state.status, 'completed');
+    assert.equal(state.exitCode, 0);
+    assert.ok(state.endedAt);
+    assert.equal(state.turns[0].result, 'completed');
+    assert.equal((f.feed().match(/状态写不进磁盘（EACCES）/g) || []).length, 1);
+    assert.equal((f.feed().match(/状态已补写/g) || []).length, 1);
+    assert.equal((f.feed().match(/✅ task 本轮完成/g) || []).length, 1);
+    assert.doesNotMatch(JSON.stringify(state), /EACCES|feedCode|noticeAt/);
+  });
+}
+
+for (const [operation, code] of [['writeFileSync', 'ENOSPC'], ['renameSync', 'EACCES']]) {
+  test(`crash safety: ${operation} ${code} never throws and warnings are throttled`, () => {
+    const source = fs.readFileSync(script, 'utf8');
+    const persistence = source.slice(source.indexOf('const persistenceErrors'), source.indexOf('function registerCrashHandlers'));
+    const feedSource = source.slice(source.indexOf('function appendFeed'), source.indexOf('function activity'));
+    let failed = true, time = 1000, payload;
+    const lines = [];
+    const fault = () => { if (failed) throw Object.assign(new Error('storage failed'), { code }); };
+    const api = vm.runInNewContext(`${persistence}\n${feedSource}\n({ saveState, feed })`, {
+      Date: { now: () => time }, clock: () => 'clock', publishAgentStatus: true,
+      writeAgentStatus: () => {}, statePath: () => '/state', feedPath: () => '/feed',
+      fs: {
+        writeFileSync: (_, text) => { if (operation === 'writeFileSync') fault(); payload = JSON.parse(text); },
+        renameSync: () => { if (operation === 'renameSync') fault(); },
+        appendFileSync: (_, text) => lines.push(text),
+      },
+    });
+    const state = { task: 'task', activity: 'initial' };
+    for (let i = 0; i < 20; i++) assert.equal(api.saveState(state), false);
+    assert.equal(lines.length, 1);
+    time += 5 * 60_000;
+    assert.equal(api.saveState(state), false);
+    assert.equal(lines.length, 2);
+    failed = false;
+    state.activity = 'latest in memory';
+    assert.equal(api.saveState(state), true);
+    assert.equal(payload.activity, 'latest in memory');
+    assert.equal(lines.filter((line) => line.includes('状态已补写')).length, 1);
+    api.saveState(state);
+    assert.equal(lines.length, 3);
+  });
+}
+
+test('crash safety: feed-only failure is silent and reported once on the next save', () => {
+  const source = fs.readFileSync(script, 'utf8');
+  const persistence = source.slice(source.indexOf('const persistenceErrors'), source.indexOf('function registerCrashHandlers'));
+  const feedSource = source.slice(source.indexOf('function appendFeed'), source.indexOf('function activity'));
+  let failed = true;
+  const lines = [];
+  const api = vm.runInNewContext(`${persistence}\n${feedSource}\n({ saveState, feed })`, {
+    Date, clock: () => 'clock', publishAgentStatus: false,
+    statePath: () => '/state', feedPath: () => '/feed',
+    fs: { writeFileSync() {}, renameSync() {}, appendFileSync: (_, text) => {
+      if (failed) throw Object.assign(new Error('feed full'), { code: 'ENOSPC' });
+      lines.push(text);
+    } },
+  });
+  const state = { task: 'task' };
+  assert.equal(api.feed(state, 'lost event'), false);
+  for (let i = 0; i < 10; i++) assert.equal(api.saveState(state), true);
+  failed = false;
+  api.saveState(state);
+  api.saveState(state);
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /状态写不进磁盘（ENOSPC）/);
+  assert.match(lines[1], /状态已补写/);
+});
+
+for (const command of ['status', 'watch', 'send', 'resume', 'stop']) {
+  test(`crash safety: ${command} heals a SIGKILLed task and preserves command behavior`, async (t) => {
+    const f = agentStatusFixture(t, 'delayed-ok');
+    assert.equal((await f.run(f.start(['--no-watch']), 'kill test')).code, 0);
+    await until(() => f.state().threadId && f.state().pid);
+    const state = f.state();
+    process.kill(state.supervisorPid, 'SIGKILL');
+    await until(() => !alive(state.supervisorPid));
+    await until(() => !alive(state.pid));
+    assert.equal(f.state().status, 'running');
+    const result = await f.run([command, 'task'], 'continue after crash');
+    assert.equal(result.code, command === 'watch' ? 6 : 0, result.stderr);
+    if (command === 'status' || command === 'watch') {
+      assert.equal(f.state().status, 'failed');
+      assert.equal(f.state().error, '监工进程意外退出（未留下结束状态）');
+      assert.ok(f.state().endedAt);
+      assert.equal(f.agent().state, 'error');
+      if (command === 'watch') assert.match(result.stdout, /监督进程意外退出/);
+      else {
+        assert.match(result.stdout, /"status": "failed"/);
+        assert.match(result.stdout, /监工进程意外退出（未留下结束状态）/);
+      }
+      const stateFile = path.join(f.runs, 'task/state.json');
+      const before = fs.statSync(stateFile).mtimeMs;
+      assert.equal((await f.run(['status', 'task'])).code, 0);
+      assert.equal(fs.statSync(stateFile).mtimeMs, before, 'healed task must not be rewritten');
+      const watch = await f.run(['watch', 'task']);
+      assert.equal(watch.code, 6);
+      assert.match(watch.stdout, /监督进程意外退出/);
+      assert.equal((await f.run(['send', 'task'], 'resume healed task')).code, 0);
+    }
+    assert.equal(f.state().status, command === 'stop' ? 'stopped' : 'completed');
+    assert.equal(f.agent().state, command === 'stop' ? 'stopped' : 'completed');
+  });
+}
+
+test('crash safety: heal includes waiting-retry but leaves a live child or supervisor alone', async (t) => {
+  const f = fixture(t, 'ok');
+  assert.equal((await f.run(f.start(), 'seed')).code, 0);
+  await until(() => !alive(f.state().supervisorPid));
+  const file = path.join(f.runs, 'task/state.json');
+  for (const [status, supervisorPid, pid, expected] of [
+    ['running', process.pid, null, 'running'], ['running', null, process.pid, 'running'],
+    ['waiting-retry', process.pid, null, 'waiting-retry'], ['waiting-retry', null, null, 'failed'],
+    ['completed', null, null, 'completed'],
+  ]) {
+    const state = { ...f.state(), status, supervisorPid, pid, error: null };
+    fs.writeFileSync(file, JSON.stringify(state));
+    assert.equal((await f.run(['status', 'task'])).code, 0);
+    assert.equal(f.state().status, expected);
+    if (expected === 'failed') assert.equal(f.state().error, '监工进程意外退出（未留下结束状态）');
+  }
+});
+
+for (const mode of ['uncaughtException', 'unhandledRejection', 'main-rejection']) {
+  test(`crash safety: real supervisor ${mode} publishes failure and exits 1`, async (t) => {
+    const f = agentStatusFixture(t, 'delayed-ok');
+    f.env.FAKE_CRASH_MODE = mode;
+    f.env.NODE_OPTIONS = `${f.env.NODE_OPTIONS || ''} --import=${path.join(repo, 'tests/fixtures/crash-injection.mjs')}`;
+    const result = await f.run(f.start(), 'injected crash');
+    assert.equal(result.code, 1, result.stderr);
+    const state = f.state();
+    assert.equal(state.status, 'failed');
+    assert.equal(state.exitCode, 1);
+    assert.equal(state.error, '注'.repeat(200));
+    assert.ok(state.endedAt);
+    await until(() => !alive(state.supervisorPid));
+    assert.equal(f.agent().state, 'error');
+    const log = fs.readFileSync(path.join(f.runs, 'task/supervisor.log'), 'utf8');
+    assert.equal(log.split('\n').filter((line) => line.startsWith('[foreman] 未捕获异常，任务停下：')).length, 1);
+    assert.doesNotMatch(log, /second line must not persist/);
+  });
+}
+
+test('crash safety: fatal handler still writes host status when state persistence throws', () => {
+  const source = fs.readFileSync(script, 'utf8');
+  const helper = source.slice(source.indexOf('function registerCrashHandlers'), source.indexOf('function pidAlive'));
+  const handlers = new Map(), lines = [];
+  let host, exit;
+  const register = vm.runInNewContext(`let crashHandler;\n${helper}\nregisterCrashHandlers`, {
+    now: () => 'ended', saveState: () => { throw new Error('disk full'); },
+    writeAgentStatus: (state) => { host = { ...state }; },
+    process: { on: (name, handler) => handlers.set(name, handler), exit: (code) => { exit = code; } },
+    console: { error: (line) => lines.push(line) },
+  });
+  const state = { status: 'running' };
+  register(state);
+  assert.equal(handlers.size, 2);
+  handlers.get('uncaughtException')(new Error('first line\nsecond line'));
+  assert.equal(host.status, 'failed');
+  assert.equal(host.error, 'first line');
+  assert.equal(host.endedAt, 'ended');
+  assert.equal(exit, 1);
+  assert.equal(lines[0], '[foreman] 未捕获异常，任务停下：first line');
+});
+
+for (const failure of ['state', 'feed', 'both', 'recover']) {
+  test(`crash safety: final persistence retries are bounded (${failure})`, async () => {
+    const source = fs.readFileSync(script, 'utf8');
+    const finishSource = source.slice(source.indexOf('async function finish'), source.indexOf('// Mailbox layout'));
+    let saves = 0, appends = 0;
+    const sleeps = [], errors = [];
+    const finish = vm.runInNewContext(`${finishSource}\nfinish`, {
+      now: () => 'ended', finalText: () => 'final', publishAgentStatus: true, writeAgentStatus() {},
+      appendFeed: () => { appends++; return failure === 'state' || (failure === 'recover' && saves >= 3); },
+      saveState: () => { saves++; return failure === 'feed' || (failure === 'recover' && saves >= 3); },
+      sleep: async (ms) => sleeps.push(ms), persistenceError: () => ({ code: 'ENOSPC' }),
+      console: { error: (line) => errors.push(line), log() {} },
+    });
+    const state = { task: 'task', turns: [] };
+    assert.equal(await finish(state, 'failed', 3, 'original error'), failure === 'recover' ? 3 : 1);
+    assert.equal(state.error, 'original error');
+    assert.equal(state.endedAt, 'ended');
+    assert.equal(sleeps.length, failure === 'recover' ? 3 : 12);
+    assert.ok(sleeps.every((ms) => ms === 5000));
+    assert.equal(saves, sleeps.length + 1);
+    assert.equal(appends, failure === 'state' ? 1 : sleeps.length + 1);
+    assert.equal(errors.length, failure === 'recover' ? 0 : 1);
+  });
+}

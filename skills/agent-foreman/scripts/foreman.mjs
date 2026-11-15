@@ -106,6 +106,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (msg) => console.log(`[foreman ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}] ${msg}`);
 
 let publishAgentStatus = false;
+let crashHandler;
 let lastAgentStatus;
 const agentName = (state) => ({ dsh: 'DSH', agy: 'Antigravity' }[state.agent] || 'Codex');
 const networkNote = (state) => state.networkSampling ? '（网络也没有数据）' : '';
@@ -163,11 +164,59 @@ function writeAgentStatus(state) {
   }
 }
 
+// Persistence failures belong to this process, never to the on-disk task schema.
+const persistenceErrors = new Map();
+function persistenceError(state) {
+  if (!persistenceErrors.has(state.task)) persistenceErrors.set(state.task, { code: null, feedCode: null, noticeAt: null, notice: null });
+  return persistenceErrors.get(state.task);
+}
+function persistenceNotice(state, code) {
+  const error = persistenceError(state);
+  const time = Date.now();
+  if (error.noticeAt == null || time - error.noticeAt >= 5 * 60_000) {
+    error.noticeAt = time;
+    error.notice = `⚠ ${state.task} 状态写不进磁盘（${code}），已暂存在内存，恢复后会补写`;
+  }
+  // The warning may itself be unwritable. Keep just this snapshot until recovery.
+  if (error.notice && feed(state, error.notice)) error.notice = null;
+}
 function saveState(state) {
-  const tmp = `${statePath(state.task)}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
-  fs.renameSync(tmp, statePath(state.task));
-  if (publishAgentStatus) writeAgentStatus(state);
+  const error = persistenceError(state);
+  try {
+    const tmp = `${statePath(state.task)}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+    fs.renameSync(tmp, statePath(state.task));
+    if (publishAgentStatus) writeAgentStatus(state);
+  } catch (err) {
+    error.code = err.code || 'UNKNOWN';
+    persistenceNotice(state, error.code);
+    return false;
+  }
+  if (error.code || error.feedCode) {
+    persistenceNotice(state, error.code || error.feedCode);
+    if (!error.notice && feed(state, `✔ ${state.task} 状态已补写`)) {
+      error.code = null;
+      error.feedCode = null;
+    }
+  }
+  return true;
+}
+
+function registerCrashHandlers(state) {
+  const fail = (err) => {
+    const message = Array.from(String(err?.message ?? err).split(/[\r\n\u2028\u2029]/)[0]).slice(0, 200).join('');
+    state.status = 'failed';
+    state.error = message;
+    state.endedAt = now();
+    state.exitCode = 1;
+    try { saveState(state); } catch { /* best effort during a crash */ }
+    try { writeAgentStatus(state); } catch { /* independent of state.json */ }
+    try { console.error(`[foreman] 未捕获异常，任务停下：${message}`); } catch { /* stderr may also be unavailable */ }
+    process.exit(1);
+  };
+  process.on('uncaughtException', fail);
+  process.on('unhandledRejection', fail);
+  crashHandler = fail;
 }
 
 function pidAlive(pid) {
@@ -186,8 +235,17 @@ function duration(ms) {
 }
 const feedPath = (task) => path.join(runDir(task), 'feed.log');
 const feedSize = (task) => { try { return fs.statSync(feedPath(task)).size; } catch { return 0; } };
+function appendFeed(state, text) {
+  try {
+    fs.appendFileSync(feedPath(state.task), text);
+    return true;
+  } catch (err) {
+    persistenceError(state).feedCode = err.code || 'UNKNOWN';
+    return false;
+  }
+}
 function feed(state, text) {
-  fs.appendFileSync(feedPath(state.task), `${clock()} ${text}\n`);
+  return appendFeed(state, `${clock()} ${text}\n`);
 }
 function activity(state, value) {
   if (!value) return;
@@ -320,6 +378,11 @@ function questionNotice(state, question) {
 async function watch(task, offset, watchMin = 29) {
   const deadline = Date.now() + watchMin * 60_000;
   let state = loadState(task);
+  const unexpectedExit = () => {
+    console.log(`${clock()} ❌ ${task} 监督进程意外退出，详见 ${path.join(runDir(task), 'supervisor.log')}`);
+    return 6;
+  };
+  if (heal(state) || (state.status === 'failed' && state.exitCode === 6)) return unexpectedExit();
   if (offset == null && terminal(state)) {
     process.stdout.write(finalText(state));
     return exitStatus(state);
@@ -350,7 +413,7 @@ async function watch(task, offset, watchMin = 29) {
   for (;;) {
     state = loadState(task);
     drain();
-    if (terminal(state)) return exitStatus(state);
+    if (terminal(state)) return state.exitCode === 6 ? unexpectedExit() : exitStatus(state);
     const question = blockingQuestion(state);
     if (question && (state.mailboxSeen?.[`q-${question.n}`] || Date.now() >= deadline)) {
       console.log(questionNotice(state, question));
@@ -360,9 +423,9 @@ async function watch(task, offset, watchMin = 29) {
       // Recheck after observing death: the supervisor may just have published its final state.
       state = loadState(task);
       drain();
-      if (terminal(state)) return exitStatus(state);
-      console.log(`${clock()} ❌ ${task} 监督进程意外退出，详见 ${path.join(runDir(task), 'supervisor.log')}`);
-      return 6;
+      if (heal(state)) return unexpectedExit();
+      if (terminal(state)) return state.exitCode === 6 ? unexpectedExit() : exitStatus(state);
+      return unexpectedExit();
     }
     if (Date.now() >= deadline) {
       console.log(`⏳ ${task} 仍在运行（跟踪满 ${watchMin} 分钟自动交回，任务不受影响）；继续跟踪：${watchCommand(task)}`);
@@ -370,6 +433,18 @@ async function watch(task, offset, watchMin = 29) {
     }
     await sleep(Math.min(500, Math.max(1, deadline - Date.now())));
   }
+}
+
+function heal(state) {
+  if (!state.task || !['running', 'waiting-retry'].includes(state.status)
+      || pidAlive(state.supervisorPid) || pidAlive(state.pid)) return false;
+  state.status = 'failed';
+  state.error = '监工进程意外退出（未留下结束状态）';
+  state.endedAt = now();
+  state.exitCode = 6;
+  saveState(state);
+  writeAgentStatus(state);
+  return true;
 }
 
 function dshAvailable(cwd) {
@@ -1024,15 +1099,26 @@ async function runWithRetries(state, prompt) {
   }
 }
 
-function finish(state, status, code, error) {
+async function finish(state, status, code, error) {
   state.waitingQuestions = [];
   state.waitingQuestionText = null;
   state.status = status;
   state.error = error || null;
   state.endedAt = now();
   state.exitCode = code;
-  fs.appendFileSync(feedPath(state.task), finalText(state));
-  saveState(state);
+  const text = finalText(state);
+  let fed = appendFeed(state, text);
+  let saved = saveState(state);
+  if (publishAgentStatus) writeAgentStatus(state);
+  for (let retry = 0; (!saved || !fed) && retry < 12; retry++) {
+    await sleep(5000);
+    if (!fed) fed = appendFeed(state, text);
+    saved = saveState(state);
+  }
+  if (!saved || !fed) {
+    console.error(`[foreman] 最终状态或 feed 写盘失败，重试 12 次后放弃（${persistenceError(state).code || persistenceError(state).feedCode}）`);
+    return 1;
+  }
   const last = state.turns.at(-1);
   console.log(JSON.stringify({ task: state.task, status, threadId: state.threadId, turns: state.turns.length, lastMessage: last?.files.last, outOfScope: last?.outOfScope ?? [], error: state.error }, null, 2));
   return code;
@@ -1259,10 +1345,12 @@ async function main() {
     // The launcher owns the initial PID publication; never overwrite it with a stale snapshot.
     let state = loadState(task);
     if (opts.internalStop) {
+      registerCrashHandlers(state);
       state.pid = null;
       return finish(state, 'stopped', 5);
     }
     while (state.supervisorPid !== process.pid) { await sleep(20); state = loadState(task); }
+    registerCrashHandlers(state);
     state.options = { ...DEFAULTS, ...state.options };
     saveState(state);
     return runWithRetries(state, fs.readFileSync(state.pendingPrompt, 'utf8'));
@@ -1270,6 +1358,7 @@ async function main() {
 
   if (cmd === 'status') {
     const s = loadState(task);
+    heal(s);
     const idle = s.lastActivityAt ? Math.round((Date.now() - Date.parse(s.lastActivityAt)) / 1000) : null;
     const last = s.turns.at(-1);
     let lastMsg = '';
@@ -1280,6 +1369,7 @@ async function main() {
   }
   if (cmd === 'stop') {
     const s = loadState(task);
+    heal(s);
     if (pidAlive(s.supervisorPid)) {
       try { process.kill(s.supervisorPid, 'SIGTERM'); } catch (err) { if (err.code !== 'ESRCH') throw err; }
       while (pidAlive(s.supervisorPid)) await sleep(50);
@@ -1298,7 +1388,9 @@ async function main() {
     return 0;
   }
 
-  const agent = cmd === 'start' ? opts.agent || 'codex' : loadState(task).agent || 'codex';
+  const previousState = cmd === 'start' ? null : loadState(task);
+  if (previousState) heal(previousState);
+  const agent = cmd === 'start' ? opts.agent || 'codex' : previousState.agent || 'codex';
   if (opts.agent && opts.agent !== agent) throw new Error(`Task ${task} uses --agent ${agent}; cannot switch agents on resume.`);
   if (agent === 'codex') checkUserConfig(task);
   let state;
@@ -1312,7 +1404,7 @@ async function main() {
     try { state.options.gitRoot = execFileSync('git', ['-C', opts.cd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { state.options.gitRoot = null; }
     prompt = await readPrompt(brief);
   } else if (cmd === 'resume' || cmd === 'send') {
-    state = loadState(task);
+    state = previousState;
     if (pidAlive(state.supervisorPid) || pidAlive(state.pid)) throw new Error(`Task ${task} 仍在运行 (still running).`);
     if (!state.threadId) throw new Error(`Task ${task} has no thread id yet; start it again under a new name.`);
     for (const k of ['idleMin', 'maxMin', 'warnMin', 'retries', 'backoffMin', 'askWaitMin', 'model', 'effort']) if (opts[k] != null) state.options[k] = opts[k];
@@ -1407,4 +1499,8 @@ async function readPrompt(file) {
   return text;
 }
 
-main().then((code) => { process.exitCode = code; }, (err) => { console.error(err.message); process.exitCode = 1; });
+main().then((code) => { process.exitCode = code; }, (err) => {
+  if (crashHandler) return crashHandler(err);
+  console.error(err.message);
+  process.exitCode = 1;
+});
