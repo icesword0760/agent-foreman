@@ -830,6 +830,8 @@ test('Matou: running metadata, quiet warning, completion and atomic cleanup', as
   await until(() => fs.existsSync(path.join(f.dir, 'codex-task.json')) && f.agent().detail === '运行 echo hello');
   const a = f.agent();
   assert.equal(a.version, 1);
+  assert.equal(a.pid, f.state().supervisorPid);
+  assert.ok(Number.isInteger(a.pid) && a.pid > 0);
   assert.equal(a.label, 'Codex：task（gpt-6.1-sol · 高档推理）');
   assert.equal(a.state, 'running');
   assert.equal(a.startedAt, f.state().runStartedAt);
@@ -948,6 +950,14 @@ test('Matou: publisher throttles duplicates, bounds detail and ignores write/ren
     assert.doesNotThrow(() => write(state));
   }
   assert.equal(cleaned, 6);
+  fail = undefined;
+  for (const [pid, expected] of [[1, 1], [12345, 12345], [undefined], [null], [0], [-1], [1.5], ['42'], [NaN], [Infinity]]) {
+    state.supervisorPid = pid;
+    time += 1000;
+    write(state);
+    if (expected === undefined) assert.equal(Object.hasOwn(payload, 'pid'), false);
+    else assert.equal(payload.pid, expected);
+  }
 });
 
 test('default runs directory uses temporary HOME for runner and statusline', (t) => {

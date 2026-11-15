@@ -155,7 +155,8 @@ function writeAgentStatus(state) {
         lastAgentStatus.label === label && lastAgentStatus.detail === detail && time - lastAgentStatus.time < 1000) return;
     tmp = `${file}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify({ version: 1, label, state: status,
-      detail, startedAt: state.runStartedAt, updatedAt: new Date(time).toISOString() }));
+      detail, startedAt: state.runStartedAt, updatedAt: new Date(time).toISOString(),
+      ...(Number.isInteger(state.supervisorPid) && state.supervisorPid > 0 ? { pid: state.supervisorPid } : {}) }));
     fs.renameSync(tmp, file);
     lastAgentStatus = { file, status, label, detail, time };
   } catch { /* Host status must never interrupt the task or recreate a removed session. */ }
