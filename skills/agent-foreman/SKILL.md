@@ -98,5 +98,6 @@ description: Use whenever work is handed to another coding agent — the user sa
 | 回复缺「我自己做的决定」 | 让它补上，并逐条复核 |
 | 交代书只转述现象，没查原因、没定方案；或者替执行者写好每一步写法 | 先查清原因、定好方案（改哪里、用什么做法），具体写法交给它；方案定不下来，先设调研关 |
 | 工作区有别人未提交的改动却没交代 | 在交代书「范围」里写明保留，禁止 stash / reset |
+| 用 `$(cat 文件)` 把交代书展开进 heredoc | 用 `--brief <文件>`；`<<'EOF'` 带引号时 shell 不展开，脚本收到的只有那一行字，会拒收 |
 
 不确定命令、选项、退出码、事件符号或遇到异常时，再读 `reference.md`。

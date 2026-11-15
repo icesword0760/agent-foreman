@@ -1399,7 +1399,11 @@ async function readPrompt(file) {
   let text = '';
   process.stdin.setEncoding('utf8');
   for await (const chunk of process.stdin) text += chunk;
-  if (!text.trim()) throw new Error(usage);
+  const trimmed = text.trim();
+  if (!trimmed) throw new Error(usage);
+  if (trimmed.length < 500 && /^(\$\([^\n]*\)|`[^\n]*`)$/.test(trimmed)) {
+    throw new Error(`交代书没有被展开：只收到「${trimmed}」这样的命令文本。heredoc 写成 <<'EOF' 时 shell 不会展开 $(...)，请改用 --brief <文件>，或把正文直接写进 heredoc。`);
+  }
   return text;
 }
 

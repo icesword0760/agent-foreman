@@ -485,6 +485,49 @@ test('validation: empty stdin and invalid numeric options return 1', async (t) =
   }
 });
 
+for (const input of ['$(cat /tmp/brief.md)', '`cat /tmp/brief.md`', `$(${'x'.repeat(496)})`]) {
+  test(`validation: unexpanded command (${input.length} chars, ${input[0]}) leaves task name reusable`, async (t) => {
+    const f = fixture(t, 'ok');
+    const result = await f.run(f.start(), ` \n${input}\n `);
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr.trim(), `交代书没有被展开：只收到「${input}」这样的命令文本。heredoc 写成 <<'EOF' 时 shell 不会展开 $(...)，请改用 --brief <文件>，或把正文直接写进 heredoc。`);
+    assert.equal(fs.existsSync(path.join(f.runs, 'task')), false);
+    assert.equal(fs.existsSync(path.join(f.root, 'fake/calls.jsonl')), false);
+    assert.equal((await f.run(f.start(), 'test')).code, 0);
+    assert.match(f.calls()[0].prompt, /^test\n/);
+  });
+}
+
+test('validation: send and resume reject unexpanded commands without starting another turn', async (t) => {
+  const f = fixture(t, 'ok');
+  assert.equal((await f.run(f.start(), 'test')).code, 0);
+  await until(() => !alive(f.state().supervisorPid));
+  const stateFile = path.join(f.runs, 'task/state.json');
+  const before = fs.readFileSync(stateFile, 'utf8');
+  for (const command of ['send', 'resume']) for (const input of ['$(cat /tmp/brief.md)', '`cat /tmp/brief.md`']) {
+    const result = await f.run([command, 'task'], input);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /没有被展开/);
+    assert.equal(fs.readFileSync(stateFile, 'utf8'), before);
+    assert.equal(f.calls().length, 1);
+    assert.equal(fs.existsSync(path.join(f.runs, 'task/run-2.prompt.md')), false);
+  }
+});
+
+test('validation: ordinary messages, multiline content and commands at least 500 chars pass unchanged', async (t) => {
+  for (const input of [
+    'test', 'failure', '继续', '跑一下 `git status`', '请执行 $(cat /tmp/brief.md)',
+    '$(cat /tmp/brief.md) 然后继续', '$(cat\n/tmp/brief.md)', '`cat\n/tmp/brief.md`',
+    `$(${'x'.repeat(497)})`, '`' + 'x'.repeat(498) + '`', '正文'.repeat(300),
+  ]) {
+    const f = fixture(t, 'ok');
+    const result = await f.run(f.start(), input);
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(f.calls()[0].prompt.startsWith(input + '\n'));
+  }
+});
+
 test('retry exhaustion returns 3; maximum turn duration returns 4', async (t) => {
   const retry = fixture(t, 'retry-then-ok');
   assert.equal((await retry.run(retry.start(['--retries', '0']), 'retry')).code, 3);
