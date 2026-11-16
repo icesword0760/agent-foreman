@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const RUNS = path.resolve(process.env.FOREMAN_RUN_DIR || path.join(os.homedir(), '.claude', 'agent-foreman', 'runs'));
+const CONFIG = path.join(path.dirname(RUNS), 'config.json');
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 const DSH_BIN = process.env.DSH_BIN || 'dsh';
 const AGY_BIN = process.env.AGY_BIN || 'agy';
@@ -16,11 +17,51 @@ const AGY_RESULT_EXIT_MS = Number(process.env.FOREMAN_AGY_RESULT_EXIT_MS) || 10_
 const AGY_QUOTA = /RESOURCE_EXHAUSTED|quota|Resets in|额度/i;
 
 const DEFAULTS = { askWaitMin: 10, model: 'sol', effort: 'high', idleMin: 10, warnMin: 3, maxMin: 45, retries: 3, backoffMin: [2, 5, 10] };
+
+function readDefaultsConfig() {
+  const result = { path: CONFIG, exists: fs.existsSync(CONFIG), defaults: {}, ignored: [] };
+  const ignore = (field, value) => result.ignored.push(`已忽略：${field}=${JSON.stringify(value) ?? 'undefined'}`);
+  if (!result.exists) return result;
+  let config;
+  try { config = JSON.parse(fs.readFileSync(CONFIG, 'utf8')); }
+  catch { ignore('config', '无法读取或不是合法 JSON'); return result; }
+  if (config?.version !== 1) { ignore('version', config?.version); return result; }
+  if (!config.defaults || typeof config.defaults !== 'object' || Array.isArray(config.defaults)) {
+    ignore('defaults', config.defaults);
+    return result;
+  }
+  const minutes = (value) => typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 600;
+  const validators = {
+    agent: (value) => ['codex', 'agy', 'dsh'].includes(value),
+    model: (value) => typeof value === 'string' && value.length > 0 && value.length <= 64 && !/\s/u.test(value),
+    effort: (value) => ['low', 'medium', 'high', 'xhigh'].includes(value),
+    idleMin: minutes, maxMin: minutes, askWaitMin: minutes,
+    retries: (value) => Number.isInteger(value) && value >= 0 && value <= 5,
+  };
+  for (const [field, value] of Object.entries(config.defaults)) {
+    if (Object.hasOwn(validators, field) && validators[field](value)) result.defaults[field] = value;
+    else ignore(field, value);
+  }
+  return result;
+}
+
+function configuredDefaults(defaults, agent, ignored = []) {
+  const { agent: _agent, model, ...rest } = defaults;
+  if (agent === 'dsh' && ['medium', 'xhigh'].includes(rest.effort)) {
+    ignored.push(`已忽略：effort=${JSON.stringify(rest.effort)}（DSH 不支持，使用内置 high）`);
+    delete rest.effort;
+  }
+  return { ...DEFAULTS,
+    ...(agent === 'dsh' ? { model: 'deepseek-flash' } : agent === 'agy' ? { model: 'gemini-pro-orchestrator' } : {}),
+    ...rest, ...(model != null && agent !== 'dsh' ? { model } : {}) };
+}
+
 const POLL_MS = Number(process.env.FOREMAN_POLL_MS) || 15_000;
 const FATAL = /\b40[13]\b|unauthori[sz]ed|not logged in|please (log|sign) in|invalid api key|sandbox.*denied/i;
 const RETRYABLE = /capacity|\b429\b|\b5\d\d\b|overloaded|rate.?limit|reconnect|stream disconnected|timed? ?out|AI 专线|ECONN|ETIMEDOUT|network|connection/i;
 
 const usage = `Usage:
+  node scripts/foreman.mjs config
   node scripts/foreman.mjs models [--model M] [--effort E] [--refresh-models]
   node scripts/foreman.mjs start  商城-购物车-01 --cd <dir> [--brief <file>] [options]
   node scripts/foreman.mjs send   商城-购物车-01 [--message <file>] [options] (resume is an alias)
@@ -37,6 +78,7 @@ Omit --brief / --message to read the prompt from stdin.
 Exit code 7: Codex 正在等回答。
 Exit code 8: 跟踪到期，任务继续运行。
 Options:
+  默认值可写在 ${CONFIG}，命令行参数优先。
   FOREMAN_RUN_DIR overrides ~/.claude/agent-foreman/runs for all commands.
   --agent codex|dsh|agy (codex; start). DSH_BIN / AGY_BIN override dsh / agy from PATH.
   agy defaults: --model gemini-pro-orchestrator (fixed; no effort levels). --model hydrogen|argon|carbon picks the newest at --effort low|medium|high|xhigh (high); --effort needs one of these.
@@ -51,8 +93,8 @@ Options:
 
 function parseArgs(argv) {
   const [cmd] = argv;
-  const task = cmd === 'models' ? undefined : argv[1];
-  const rest = argv.slice(cmd === 'models' ? 1 : 2);
+  const task = ['models', 'config'].includes(cmd) ? undefined : argv[1];
+  const rest = argv.slice(['models', 'config'].includes(cmd) ? 1 : 2);
   const opts = { addDirs: [] };
   for (let i = 0; i < rest.length; i++) {
     const key = rest[i];
@@ -1314,6 +1356,12 @@ async function launchSupervisor(task) {
 
 async function main() {
   const { cmd, task, opts } = parseArgs(process.argv.slice(2));
+  if (cmd === 'config') {
+    const config = readDefaultsConfig();
+    const agent = config.defaults.agent ?? 'codex';
+    console.log(JSON.stringify({ ...config, defaults: { agent, ...configuredDefaults(config.defaults, agent, config.ignored) } }, null, 2));
+    return 0;
+  }
   if (cmd === 'models') {
     if (opts.agent === 'agy') throw new Error('Antigravity 不使用 Codex 模型目录；请用 agy models 查看');
     if (opts.agent === 'dsh') throw new Error('DSH 不使用 Codex 模型目录；start --agent dsh --model 可用 flash、pro 或型号名');
@@ -1391,7 +1439,8 @@ async function main() {
 
   const previousState = cmd === 'start' ? null : loadState(task);
   if (previousState) heal(previousState);
-  const agent = cmd === 'start' ? opts.agent || 'codex' : previousState.agent || 'codex';
+  const configDefaults = cmd === 'start' ? readDefaultsConfig().defaults : {};
+  const agent = cmd === 'start' ? opts.agent ?? configDefaults.agent ?? 'codex' : previousState.agent || 'codex';
   if (opts.agent && opts.agent !== agent) throw new Error(`Task ${task} uses --agent ${agent}; cannot switch agents on resume.`);
   if (agent === 'codex') checkUserConfig(task);
   let state;
@@ -1401,7 +1450,7 @@ async function main() {
     if (!fs.existsSync(opts.cd) || !fs.statSync(opts.cd).isDirectory()) throw new Error(`Work dir does not exist: ${opts.cd}`);
     if (fs.existsSync(statePath(task))) throw new Error(`Task ${task} already exists; use resume or pick a new name.`);
     const { brief, message, agent: _agent, ...rest } = opts;
-    state = { task, agent, createdAt: now(), status: 'new', threadId: null, pid: null, turns: [], options: { ...DEFAULTS, ...(agent === 'dsh' ? { model: 'deepseek-flash' } : agent === 'agy' ? { model: 'gemini-pro-orchestrator', effort: 'high' } : {}), fullAccess: true, ...rest } };
+    state = { task, agent, createdAt: now(), status: 'new', threadId: null, pid: null, turns: [], options: { ...configuredDefaults(configDefaults, agent), fullAccess: true, ...rest } };
     try { state.options.gitRoot = execFileSync('git', ['-C', opts.cd, 'rev-parse', '--show-toplevel'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { state.options.gitRoot = null; }
     prompt = await readPrompt(brief);
   } else if (cmd === 'resume' || cmd === 'send') {

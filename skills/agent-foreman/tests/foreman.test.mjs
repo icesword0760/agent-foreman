@@ -107,6 +107,297 @@ function writeConfig(f, text) {
   return file;
 }
 
+function writeForemanConfig(f, defaults, version = 1) {
+  const file = path.join(path.dirname(f.runs), 'config.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ version, defaults }));
+  return file;
+}
+
+const builtinForemanDefaults = { agent: 'codex', askWaitMin: 10, model: 'sol', effort: 'high',
+  idleMin: 10, warnMin: 3, maxMin: 45, retries: 3, backoffMin: [2, 5, 10] };
+
+test('global config: absent file reports builtins without writes and start keeps original defaults', async (t) => {
+  const f = fixture(t, 'ok');
+  const result = await f.run(['config']);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { path: path.join(f.root, 'config.json'), exists: false,
+    defaults: builtinForemanDefaults, ignored: [] });
+  assert.equal(fs.existsSync(f.runs), false);
+  assert.equal(fs.existsSync(path.join(f.root, 'config.json')), false);
+  assert.equal((await f.run(['start', 'task', '--cd', f.root], 'builtins')).code, 0);
+  assert.equal(f.state().agent, 'codex');
+  const { agent: _agent, ...options } = builtinForemanDefaults;
+  for (const [field, value] of Object.entries(options)) {
+    assert.deepEqual(f.state().options[field], field === 'model' ? 'gpt-6.1-sol' : value, field);
+  }
+});
+
+test('global config: legal fields reach config output, stored start options and executor; deleting restores builtins', async (t) => {
+  const f = fixture(t, 'ok');
+  const defaults = { agent: 'codex', model: 'astra', effort: 'medium', idleMin: 12, maxMin: 34, askWaitMin: 8, retries: 0 };
+  const file = writeForemanConfig(f, defaults);
+  const before = fs.readFileSync(file, 'utf8');
+  const output = await f.run(['config', '--model', 'ignored-cli-model']);
+  assert.equal(output.code, 0, output.stderr);
+  assert.deepEqual(JSON.parse(output.stdout), { path: file, exists: true,
+    defaults: { ...builtinForemanDefaults, ...defaults }, ignored: [] });
+  assert.equal(fs.readFileSync(file, 'utf8'), before);
+  assert.equal(fs.existsSync(f.runs), false);
+  assert.equal((await f.run(['start', 'task', '--cd', f.root], 'configured')).code, 0);
+  assert.equal(f.state().agent, defaults.agent);
+  for (const [field, value] of Object.entries(defaults)) {
+    if (field !== 'agent') assert.equal(f.state().options[field], field === 'model' ? 'gpt-6-astra' : value, field);
+  }
+  const { argv } = f.calls()[0];
+  assert.equal(argv[argv.indexOf('-m') + 1], 'gpt-6-astra');
+  assert.ok(argv.includes('model_reasoning_effort="medium"'));
+  fs.unlinkSync(file);
+  assert.deepEqual(JSON.parse((await f.run(['config'])).stdout).defaults, builtinForemanDefaults);
+  assert.equal((await f.run(['start', 'after-delete', '--cd', f.root], 'restored')).code, 0);
+  assert.equal(f.state('after-delete').options.model, 'gpt-6.1-sol');
+  assert.equal(f.state('after-delete').options.idleMin, 10);
+});
+
+test('global config: command line overrides every configured start field including agent', async (t) => {
+  const f = fixture(t, 'ok');
+  writeForemanConfig(f, { agent: 'agy', model: 'hydrogen', effort: 'xhigh', idleMin: 12, maxMin: 34, askWaitMin: 8, retries: 5 });
+  const result = await f.run(['start', 'task', '--cd', f.root, '--agent', 'codex', '--model', 'gpt-6.1-sol',
+    '--effort', 'low', '--idle-min', '13', '--max-min', '35', '--ask-wait-min', '9', '--retries', '0'], 'overrides');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().agent, 'codex');
+  for (const [field, value] of Object.entries({ model: 'gpt-6.1-sol', effort: 'low', idleMin: 13, maxMin: 35, askWaitMin: 9, retries: 0 })) {
+    assert.equal(f.state().options[field], value, field);
+  }
+  assert.ok(f.calls()[0].argv.includes('model_reasoning_effort="low"'));
+});
+
+test('global config: invalid and unknown fields are listed independently while valid fields still launch', async (t) => {
+  const f = fixture(t, 'ok');
+  const invalid = { agent: 'other', model: 'bad model', effort: 'max', idleMin: '12', maxMin: 601,
+    retries: 1.5, warnMin: 99, fullAccess: false, backoffMin: [0], constructor: 'ignored', __proto__: null };
+  writeForemanConfig(f, { ...invalid, askWaitMin: 17 });
+  const output = JSON.parse((await f.run(['config'])).stdout);
+  assert.deepEqual(output.defaults, { ...builtinForemanDefaults, askWaitMin: 17 });
+  assert.deepEqual(output.ignored, Object.entries(invalid).map(([field, value]) => `已忽略：${field}=${JSON.stringify(value)}`));
+  const result = await f.run(['start', 'task', '--cd', f.root], 'mixed config');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().options.askWaitMin, 17);
+  assert.equal(f.state().options.idleMin, 10);
+  assert.equal(f.state().options.fullAccess, true);
+  assert.equal(f.state().options.model, 'gpt-6.1-sol');
+});
+
+for (const [field, invalidValues] of Object.entries({
+  agent: ['', 'Codex', null, 1],
+  model: ['', 'a'.repeat(65), 'with\ttab', 'with\nnewline', 'with\u00a0space', 1, null],
+  effort: ['off', 'HIGH', null, 1],
+  idleMin: [0, -1, 600.01, '1', null, true],
+  maxMin: [0, -1, 600.01, '1', null, false],
+  askWaitMin: [0, -1, 600.01, '1', null, []],
+  retries: [-1, 6, 0.5, '3', null, true],
+})) test(`global config: schema rejects each invalid ${field} without losing siblings`, async (t) => {
+  const f = fixture(t, 'ok');
+  for (const value of invalidValues) {
+    writeForemanConfig(f, { [field]: value, unknown: 'ignored' });
+    const result = await f.run(['config']);
+    assert.equal(result.code, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.deepEqual(output.defaults, builtinForemanDefaults);
+    assert.ok(output.ignored.includes(`已忽略：${field}=${JSON.stringify(value)}`));
+  }
+});
+
+test('global config: schema accepts inclusive upper bounds, fractions and zero retries', async (t) => {
+  const f = fixture(t, 'ok');
+  const defaults = { model: 'a'.repeat(64), effort: 'xhigh', idleMin: 600, maxMin: 0.001, askWaitMin: 600, retries: 5 };
+  writeForemanConfig(f, defaults);
+  let output = JSON.parse((await f.run(['config'])).stdout);
+  assert.deepEqual(output.defaults, { ...builtinForemanDefaults, ...defaults });
+  assert.deepEqual(output.ignored, []);
+  writeForemanConfig(f, { retries: 0 });
+  assert.equal(JSON.parse((await f.run(['config'])).stdout).defaults.retries, 0);
+  fs.writeFileSync(path.join(f.root, 'config.json'), '{"version":1,"defaults":{"idleMin":1e400,"maxMin":-1e400,"askWaitMin":3}}');
+  output = JSON.parse((await f.run(['config'])).stdout);
+  assert.deepEqual(output.defaults, { ...builtinForemanDefaults, askWaitMin: 3 });
+  assert.equal(output.ignored.length, 2);
+});
+
+for (const version of [2, '1', null, false]) test(`global config: version ${JSON.stringify(version)} ignores the whole file and start still works`, async (t) => {
+  const f = fixture(t, 'ok');
+  writeForemanConfig(f, { agent: 'agy', model: 'hydrogen', effort: 'low', idleMin: 600 }, version);
+  const output = JSON.parse((await f.run(['config'])).stdout);
+  assert.deepEqual(output.defaults, builtinForemanDefaults);
+  assert.deepEqual(output.ignored, [`已忽略：version=${JSON.stringify(version)}`]);
+  const result = await f.run(['start', 'task', '--cd', f.root], 'wrong version');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().agent, 'codex');
+  assert.equal(f.state().options.idleMin, 10);
+});
+
+for (const text of ['{', 'null', '[]', '{}', '{"defaults":{"idleMin":600}}',
+  '{"version":1}', '{"version":1,"defaults":null}', '{"version":1,"defaults":[]}', '{"version":1,"defaults":"bad"}']) {
+  test(`global config: malformed document ${text} falls back and permits start`, async (t) => {
+    const f = fixture(t, 'ok');
+    const file = path.join(f.root, 'config.json');
+    fs.writeFileSync(file, text);
+    const result = await f.run(['config']);
+    assert.equal(result.code, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.path, file);
+    assert.equal(output.exists, true);
+    assert.deepEqual(output.defaults, builtinForemanDefaults);
+    assert.equal(output.ignored.length, 1);
+    const started = await f.run(['start', 'task', '--cd', f.root], 'fallback');
+    assert.equal(started.code, 0, started.stderr);
+    assert.equal(f.state().options.model, 'gpt-6.1-sol');
+    assert.equal(fs.readFileSync(file, 'utf8'), text);
+  });
+}
+
+test('global config: unreadable file falls back without blocking start', async (t) => {
+  const f = fixture(t, 'ok');
+  fs.mkdirSync(path.join(f.root, 'config.json'));
+  const output = JSON.parse((await f.run(['config'])).stdout);
+  assert.equal(output.exists, true);
+  assert.deepEqual(output.defaults, builtinForemanDefaults);
+  assert.equal(output.ignored.length, 1);
+  const result = await f.run(['start', 'task', '--cd', f.root], 'unreadable');
+  assert.equal(result.code, 0, result.stderr);
+});
+
+for (const command of ['send', 'resume']) test(`global config: ${command} preserves stored options despite a changed global file`, async (t) => {
+  const f = fixture(t, 'ok');
+  writeForemanConfig(f, { model: 'gpt-6.1-sol', effort: 'medium', idleMin: 12, maxMin: 34, askWaitMin: 8, retries: 0 });
+  assert.equal((await f.run(['start', 'task', '--cd', f.root], 'initial')).code, 0);
+  await until(() => !alive(f.state().supervisorPid));
+  const previous = f.state().options;
+  writeForemanConfig(f, { agent: 'dsh', model: 'ignored', effort: 'xhigh', idleMin: 600, maxMin: 600, askWaitMin: 600, retries: 5 });
+  const result = await f.run([command, 'task'], 'continue');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().agent, 'codex');
+  assert.deepEqual(f.state().options, previous);
+});
+
+test('global config: usage documents config command and the resolved file path', async (t) => {
+  const f = fixture(t, 'ok');
+  const result = await f.run([]);
+  assert.equal(result.code, 1);
+  assert.ok(result.stderr.includes('node scripts/foreman.mjs config'));
+  assert.ok(result.stderr.includes(`默认值可写在 ${path.join(f.root, 'config.json')}，命令行参数优先`));
+});
+
+test('global config: default HOME places the file beside the default runs directory', async (t) => {
+  const f = fixture(t, 'ok', true);
+  const file = writeForemanConfig(f, { askWaitMin: 19 });
+  const output = JSON.parse((await f.run(['config'])).stdout);
+  assert.equal(output.path, path.join(f.root, '.claude/agent-foreman/config.json'));
+  assert.equal(output.path, file);
+  assert.equal(output.defaults.askWaitMin, 19);
+  assert.equal(fs.existsSync(f.runs), false);
+});
+
+for (const series of ['hydrogen', 'argon', 'carbon']) test(`global config: agy ${series} resolves newest configured effort`, async (t) => {
+  const f = agyFixture(t);
+  f.env.FAKE_AGY_MODELS = `gemini-4-${series}-medium\ngemini-4.10-${series}-medium\ngemini-4.9-${series}-medium\ngemini-99-${series}-high`;
+  writeForemanConfig(f, { agent: 'agy', model: series, effort: 'medium' });
+  const output = JSON.parse((await f.run(['config'])).stdout);
+  assert.equal(output.defaults.model, series);
+  assert.equal(output.defaults.effort, 'medium');
+  assert.equal(agyModelCalls(f).length, 0);
+  const result = await f.run(['start', 'task', '--cd', f.root], 'configured series');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().agent, 'agy');
+  assert.equal(f.state().options.model, `gemini-4.10-${series}-medium`);
+  assert.equal(agyModelCalls(f).length, 1);
+  assert.equal(modelCalls(f).length, 0);
+});
+
+for (const configuredModel of ['hydrogen', 'gemini-4-carbon-low', 'gemini-pro-orchestrator-argon', 'custom-model', undefined]) {
+  test(`global config: agy model ${configuredModel ?? 'omitted'} preserves existing model semantics`, async (t) => {
+    const f = agyFixture(t);
+    writeForemanConfig(f, { agent: 'agy', ...(configuredModel == null ? {} : { model: configuredModel }) });
+    const result = await f.run(['start', 'task', '--cd', f.root], 'configured model');
+    assert.equal(result.code, 0, result.stderr);
+    const expected = configuredModel === 'hydrogen' ? 'gemini-4-hydrogen-high' : configuredModel ?? 'gemini-pro-orchestrator';
+    assert.equal(f.state().options.model, expected);
+    assert.equal(f.state().options.effort, 'high');
+    assert.equal(agyModelCalls(f).length, configuredModel === 'hydrogen' ? 1 : 0);
+    const call = f.calls()[0];
+    assert.equal(call.argv[call.argv.indexOf('--model') + 1], expected);
+  });
+}
+
+test('global config: agy fixed model accepts configured effort without triggering explicit CLI effort validation', async (t) => {
+  const f = agyFixture(t);
+  writeForemanConfig(f, { agent: 'agy', effort: 'xhigh' });
+  const result = await f.run(['start', 'task', '--cd', f.root], 'fixed model');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().options.model, 'gemini-pro-orchestrator');
+  assert.equal(f.state().options.effort, 'xhigh');
+  assert.equal(agyModelCalls(f).length, 0);
+});
+
+test('global config: CLI agy series and effort override configured values', async (t) => {
+  const f = agyFixture(t);
+  writeForemanConfig(f, { agent: 'agy', model: 'carbon', effort: 'medium' });
+  const result = await f.run(['start', 'task', '--cd', f.root, '--model', 'hydrogen', '--effort', 'xhigh'], 'overridden series');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().options.model, 'gemini-4-hydrogen-xhigh');
+  assert.equal(f.state().options.effort, 'xhigh');
+});
+
+for (const effort of ['low', 'high']) test(`global config: dsh ignores configured model and uses configured ${effort} effort`, async (t) => {
+  const f = dshFixture(t);
+  writeForemanConfig(f, { agent: 'dsh', model: 'sol', effort });
+  const output = JSON.parse((await f.run(['config'])).stdout);
+  assert.equal(output.defaults.model, 'deepseek-flash');
+  assert.equal(output.defaults.effort, effort);
+  const result = await f.run(['start', 'task', '--cd', f.root], 'configured dsh');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().agent, 'dsh');
+  assert.equal(f.state().options.model, 'deepseek-flash');
+  assert.ok(f.calls()[0].patch.includes(`reasoningEffort: "${effort}"`));
+});
+
+test('global config: explicit CLI dsh model and effort retain priority', async (t) => {
+  const f = dshFixture(t);
+  writeForemanConfig(f, { agent: 'dsh', model: 'sol', effort: 'low' });
+  const result = await f.run(['start', 'task', '--cd', f.root, '--model', 'pro', '--effort', 'max'], 'explicit dsh');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().options.model, 'deepseek-v4-pro');
+  assert.equal(f.state().options.effort, 'max');
+});
+
+for (const effort of ['medium', 'xhigh']) test(`global config: unsupported dsh config effort ${effort} falls back, reports it and preserves CLI overrides`, async (t) => {
+  const f = dshFixture(t);
+  writeForemanConfig(f, { agent: 'dsh', model: 'hydrogen', effort, askWaitMin: 16 });
+  const output = JSON.parse((await f.run(['config'])).stdout);
+  assert.equal(output.defaults.effort, 'high');
+  assert.equal(output.defaults.model, 'deepseek-flash');
+  assert.equal(output.defaults.askWaitMin, 16);
+  assert.deepEqual(output.ignored, [`已忽略：effort="${effort}"（DSH 不支持，使用内置 high）`]);
+  let result = await f.run(['start', 'task', '--cd', f.root], 'fallback');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().options.effort, 'high');
+  assert.ok(f.calls()[0].patch.includes('reasoningEffort: "high"'));
+  result = await f.run(['start', 'cli-override', '--cd', f.root, '--effort', 'low'], 'CLI override');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state('cli-override').options.effort, 'low');
+  result = await f.run(['start', 'cli-invalid', '--cd', f.root, '--effort', effort], 'CLI unchanged');
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /DSH --effort must be off, low, high or max/);
+});
+
+test('global config: effort uses final CLI agent instead of configured agent for DSH compatibility', async (t) => {
+  const f = fixture(t, 'ok');
+  writeForemanConfig(f, { agent: 'dsh', model: 'gpt-6.1-sol', effort: 'medium' });
+  const result = await f.run(['start', 'task', '--cd', f.root, '--agent', 'codex'], 'switch agent');
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.state().options.effort, 'medium');
+  assert.equal(f.state().options.model, 'gpt-6.1-sol');
+});
+
 for (const [name, flags, fullAccess] of [
   ['default danger-full-access', [], true],
   ['explicit --sandbox workspace-write', ['--sandbox'], false],
