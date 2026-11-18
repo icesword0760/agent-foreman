@@ -681,6 +681,22 @@ test('ok: stdin brief, ordered feed, reply, thread id, and terminal watch', asyn
   t.diagnostic('ok feed.log 原文：\n' + f.feed());
 });
 
+test('Codex -o resolves a symlinked runs directory while state keeps the original path', async (t) => {
+  const f = fixture(t, 'ok');
+  const realRuns = path.join(f.root, 'real-runs');
+  fs.mkdirSync(realRuns);
+  fs.symlinkSync(realRuns, f.runs, 'dir');
+
+  const result = await f.run(f.start(), '执行测试任务');
+  assert.equal(result.code, 0, result.stderr);
+  const state = f.state();
+  assert.equal(state.status, 'completed');
+  assert.equal(state.turns[0].files.last, path.join(f.runs, 'task', 'turn-1.last.txt'));
+  const [call] = f.calls();
+  assert.equal(call.argv[call.argv.indexOf('-o') + 1], path.join(fs.realpathSync(realRuns), 'task', 'turn-1.last.txt'));
+  assert.match(result.stdout, /--- Codex 回复 ---\n假 Codex 回复：任务完成。\n第二行完整保留。/);
+});
+
 test('send: stdin and legacy resume --message preserve thread', async (t) => {
   const f = fixture(t, 'ok');
   assert.equal((await f.run(f.start(), 'initial')).code, 0);

@@ -686,6 +686,14 @@ function checkUserConfig(task) {
   }
 }
 
+/** Codex 0.169+ rejects --output-last-message paths whose parent traverses a symlink. */
+function physicalPath(file) {
+  const resolve = (value) => fs.realpathSync.native ? fs.realpathSync.native(value) : fs.realpathSync(value);
+  try { return resolve(file); } catch {
+    try { return path.join(resolve(path.dirname(file)), path.basename(file)); } catch { return file; }
+  }
+}
+
 function buildArgs(state, lastFile, resume) {
   const o = state.options;
   const args = [
@@ -694,7 +702,7 @@ function buildArgs(state, lastFile, resume) {
     '-c', `service_tier="${process.env.CODEX_SERVICE_TIER || 'default'}"`,
     // Codex auto-approves MCP permission prompts with full access + never (including per-tool prompt mode).
     '-c', 'approval_policy="never"',
-    '--add-dir', runDir(state.task), '-o', lastFile,
+    '--add-dir', physicalPath(runDir(state.task)), '-o', physicalPath(lastFile),
   ];
   if (o.network) args.push('-c', 'sandbox_workspace_write.network_access=true');
   if (o.noProjectDoc) args.push('-c', 'project_doc_max_bytes=0');
