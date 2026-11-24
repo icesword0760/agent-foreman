@@ -1899,13 +1899,14 @@ for (const value of ['0', '-1', 'NaN', 'Infinity']) test(`watch-min rejects inva
 });
 
 
-test('Matou: label translates efforts, omits unresolved model and immediately publishes model changes', () => {
+test('Matou: label translates efforts and service tier, omits unresolved model and immediately publishes model changes', () => {
   const source = fs.readFileSync(script, 'utf8');
   const publisher = source.slice(source.indexOf('let publishAgentStatus'), source.indexOf('function saveState'));
   let payload;
   let writes = 0;
+  const fakeProcess = { pid: 42, env: {} };
   const write = vm.runInNewContext(publisher + '\nwriteAgentStatus', {
-    path, process: { pid: 42 }, Date: class extends Date { static now() { return 1000; } },
+    path, process: fakeProcess, Date: class extends Date { static now() { return 1000; } },
     fs: {
       writeFileSync: (_, text) => { writes++; payload = JSON.parse(text); },
       renameSync() {}, unlinkSync() {},
@@ -1922,6 +1923,12 @@ test('Matou: label translates efforts, omits unresolved model and immediately pu
     state.options = { ...state.options, model: '', effort };
     write(state);
     assert.equal(payload.label, `Codex：task（${expected}推理）`);
+  }
+  state.options = { ...state.options, model: 'gpt-6.2-sol', effort: 'high' };
+  for (const [tier, expected] of [['default', ''], ['fast', ' · 快速'], ['ultrafast', ' · 超快'], ['priority', ' · 优先'], ['flex', ' · 弹性'], ['turbo', ' · turbo']]) {
+    fakeProcess.env = tier == null ? {} : { CODEX_SERVICE_TIER: tier };
+    write(state);
+    assert.equal(payload.label, `Codex：task（gpt-6.2-sol · 高档推理${expected}）`);
   }
 });
 
@@ -3516,3 +3523,80 @@ for (const failure of ['state', 'feed', 'both', 'recover']) {
     assert.equal(errors.length, failure === 'recover' ? 0 : 1);
   });
 }
+
+test('guide subcommand prints skill docs on demand and rejects unknown topics', async (t) => {
+  const f = fixture(t);
+  const main = await f.run(['guide']);
+  assert.equal(main.code, 0, main.stderr);
+  assert.match(main.stdout, /name:\s*agent-foreman/);
+  assert.match(main.stdout, /mt-foreman/);
+  const brief = await f.run(['guide', 'brief']);
+  assert.equal(brief.code, 0, brief.stderr);
+  assert.ok(brief.stdout.length > 0);
+  const ref = await f.run(['guide', 'reference']);
+  assert.equal(ref.code, 0, ref.stderr);
+  assert.match(ref.stdout, /# 派活监工参考/);
+  const invalid = await f.run(['guide', 'unknown-topic']);
+  assert.equal(invalid.code, 1);
+});
+
+test('recursion guard blocks worker dispatch except Codex -> DSH depth-1 subtask', async (t) => {
+  const f1 = fixture(t, 'ok');
+  f1.env.MATOU_FOREMAN_DEPTH = '1';
+  f1.env.MATOU_FOREMAN_PARENT_AGENT = 'codex';
+  const blockedCodex = await f1.run(f1.start(), 'nested codex');
+  assert.equal(blockedCodex.code, 1);
+  assert.match(blockedCodex.stderr, /禁止再次派活/);
+
+  const f2 = fixture(t, 'ok');
+  f2.env.MATOU_FOREMAN_DEPTH = '2';
+  f2.env.MATOU_FOREMAN_PARENT_AGENT = 'codex';
+  const blockedDeepDsh = await f2.run(f2.start(['--agent', 'dsh']), 'nested dsh depth 2');
+  assert.equal(blockedDeepDsh.code, 1);
+  assert.match(blockedDeepDsh.stderr, /禁止再次派活/);
+});
+
+test('MATOU_FOREMAN_ROLES_FILE drives roles/guide output, disabled agent block, and sub-dispatch guard', async (t) => {
+  const f = fixture(t, 'ok');
+  const rolesFile = path.join(f.root, 'dispatch-roles.json');
+  fs.writeFileSync(rolesFile, JSON.stringify({
+    version: 1,
+    allowSubDispatch: false,
+    agents: [
+      { id: 'codex', enabled: true, mode: 'auto', model: 'sol', effort: 'high', speed: 'ultrafast', role: '主力写码' },
+      { id: 'dsh', enabled: false, mode: 'auto', model: 'deepseek-flash', effort: 'high', role: '前端设计' },
+      { id: 'agy', enabled: true, mode: 'explicit', model: 'hydrogen', effort: 'xhigh', role: '架构咨询' },
+    ],
+  }));
+  f.env.MATOU_FOREMAN_ROLES_FILE = rolesFile;
+
+  const rolesOut = await f.run(['roles']);
+  assert.equal(rolesOut.code, 0, rolesOut.stderr);
+  assert.match(rolesOut.stdout, /速度: 超快/);
+  assert.match(rolesOut.stdout, /已停用（禁止派活）.*DSH/);
+  assert.match(rolesOut.stdout, /已关闭（所有执行者禁止二次转包/);
+
+  const guideOut = await f.run(['guide']);
+  assert.equal(guideOut.code, 0, guideOut.stderr);
+  assert.match(guideOut.stdout, /用户自定义 Agent 生态位与默认配置/);
+  assert.match(guideOut.stdout, /架构咨询/);
+
+  const disabledStart = await f.run(f.start(['--agent', 'dsh']), 'should block disabled dsh');
+  assert.equal(disabledStart.code, 1);
+  assert.match(disabledStart.stderr, /已.*停用，禁止派活/);
+
+  // Enable DSH as auto, keep allowSubDispatch=false -> depth=1 codex->dsh must still be blocked
+  fs.writeFileSync(rolesFile, JSON.stringify({
+    version: 1,
+    allowSubDispatch: false,
+    agents: [
+      { id: 'codex', enabled: true, mode: 'auto', model: 'sol', effort: 'high', speed: 'default', role: '主力' },
+      { id: 'dsh', enabled: true, mode: 'auto', model: 'deepseek-flash', effort: 'high', role: '前端' },
+    ],
+  }));
+  f.env.MATOU_FOREMAN_DEPTH = '1';
+  f.env.MATOU_FOREMAN_PARENT_AGENT = 'codex';
+  const blockedSub = await f.run(f.start(['--agent', 'dsh']), 'blocked by allowSubDispatch=false');
+  assert.equal(blockedSub.code, 1);
+  assert.match(blockedSub.stderr, /禁止再次派活/);
+});
