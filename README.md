@@ -1,8 +1,8 @@
 <h1 align="center">Agent Foreman (派活监工)</h1>
 
 <p align="center">
-  <strong>Let Claude Code direct Codex CLI like a foreman</strong><br>
-  Claude writes the brief, dispatches the work, watches live progress, answers the agent's questions, and accepts the result by looking at real evidence.
+  <strong>Turn specialized coding AIs into one coordinated team — let any AI direct Codex, DSH &amp; Antigravity like a foreman</strong><br>
+  The lead writes a structured brief, dispatches execution, watches live events and network activity, answers mid-task questions, and accepts work by inspecting real output and a decision log.
 </p>
 
 <p align="center">
@@ -12,32 +12,50 @@
   <a href="README.zh-CN.md">中文</a>
 </p>
 
-Claude is good at understanding what you want, making product calls and judging results. Codex is good at grinding through long, well-defined execution. Agent Foreman is a [Claude Code](https://claude.com/claude-code) skill that splits the work that way: Claude stays the lead, and Codex (or, optionally, the DSH CLI) does the hands-on work under supervision.
+Every top coding AI is heavily specialized: some excel at product reasoning, architecture and acceptance, others grind through well-defined implementation fast and reliably, others shine at front-end UI aesthetics, and others bring strong creative brainstorming and cross-domain review. Calling `codex exec` or a thin skill directly feels like mailing a postcard: twenty minutes of silence with no clue whether it hung or is thinking, no way for the worker to ask a question mid-task, and a bare "done" with no record of what it decided on its own.
 
-Calling `codex exec` directly from Claude works until it doesn't: the call blocks for half an hour with no progress, a stalled run is indistinguishable from a busy one, Codex can't ask anything mid-task, and "done" arrives with no record of what it decided on its own. Agent Foreman puts a small supervisor in between.
+**Agent Foreman** is a standalone MIT-licensed skill and supervisor script. **It is not locked to Claude Code**: Claude Code, Codex, DSH, Antigravity, or any shell-capable coding agent can act as the lead foreman, delegating work to the right specialist under live supervision, two-way Q&amp;A, and gated acceptance.
 
-## What you get
+## Default Roles &amp; Natural-Language Control
 
-- **Live events.** Every step Codex takes (command run, file changed, its own progress notes) streams into Claude's Monitor as one line. Claude keeps working and reacts when something matters.
-- **Stall detection and retries.** Silence triggers a warning, then a restart in the same session with backoff. On macOS the supervisor reads Codex's network traffic, so a long silent generation is not mistaken for a hang.
-- **Two-way questions.** Codex can ask a blocking question (it waits for Claude's answer) or a non-blocking one (it proceeds with its stated default). Claude can also leave notes that Codex picks up after each step.
-- **Gates and a decision list.** Codex stops at the checkpoints in the brief and ends every turn with what it did, where the output is, its self-check, and **every decision it made on its own**, so Claude reviews choices instead of trusting a "done".
-- **A brief template that prevents drift.** Goal, real usage scenario, developer intent (the user's own words), project intent, and acceptance criteria are separate required slots. When Codex hands part of the work to a sub-agent, the sub-agent reads the original brief instead of a paraphrase, and its decisions are reported back labeled.
-- **Model selection.** Defaults to the newest model in Codex's main (sol) family at high reasoning, resolved at start. Anything that needs computer use (clicking through desktop apps, Blender modeling) goes to a sub-agent on the newest terra model, so the main model never switches.
-- **Optional DSH for front-end UI.** If the `dsh` CLI is installed, front-end UI design and its interface code go to a DSH sub-task (DeepSeek V4.1 Flash, high reasoning), and Codex integrates the result.
-- **Optional Antigravity.** If the `agy` CLI is installed, a task can be handed to Antigravity with `--agent agy` (default `gemini-pro-orchestrator`, which has no reasoning levels; `--model hydrogen`, `argon` or `carbon` picks the newest model of that series at `--effort`; Orchestrator models may delegate to their own subagents, other models may not). It never falls back to another model: when the chosen model is unavailable or out of quota, the task fails with the reason.
-- **Parallel work.** Guidance for splitting independent work across git worktrees or branches, running several agents at once, and merging after acceptance.
-- **Survives the Monitor timeout.** The supervisor is detached from the command that started it. When Claude's 30-minute Monitor expires, only the watching stops; the task keeps running and Claude re-attaches with `watch`.
-- **Status display.** In the [Matou](https://github.com/icesword0760/matou) terminal workbench, each task appears as a card in the bottom bar with the agent, task name, model and reasoning level. In other terminals, a status-line script adds one line per task.
+Works out of the box with sensible defaults, while letting you **change rules or route any task ad-hoc in plain natural language** (e.g., *"have Antigravity review this architecture first"*, *"send this page straight to DSH"*, or *"switch Codex default to ultrafast"*):
+
+| Role | Default Trigger | Default Model &amp; Effort | Specialty |
+|---|---|---|---|
+| **Lead Foreman (any session)** | Your active session | Your choice (Claude / Antigravity / Codex / DSH, etc.) | Intent, product trade-offs, root-cause &amp; plan, real-evidence acceptance |
+| **Codex** | Auto by role (primary) | Latest `sol` + high reasoning (`terra` sub-agent for computer use) | Implementation, tests, refactors, source research, data processing, packaging |
+| **DSH** (optional) | Auto by role / **sub-dispatch** | `deepseek-flash` (DeepSeek V4.1 Flash) + high reasoning | Front-end UI design, layout, styling, and interactive components |
+| **Antigravity** (optional) | Explicit mention (`--agent agy`) | `gemini-pro-orchestrator` (supports parallel sub-agents) | Deep consultation, ideation, cross-domain design review &amp; parallel research |
+
+- **Executor sub-dispatch with recursion guard.** When a large task is handed to Codex and includes front-end UI work, Codex can sub-dispatch that slice to DSH on its own and integrate the result. Sub-agents read the original brief directly (no telephone-game paraphrasing), and `MATOU_FOREMAN_DEPTH` prevents runaway recursion.
+- **No silent model fallback.** If a requested model (especially an explicitly chosen Antigravity model) is unavailable or out of quota, the task fails cleanly with the reason so you decide where to re-route it.
+
+## What You Get
+
+- **Live event stream.** Every step the worker takes (commands, file edits, progress milestones) streams out as one-line events — asynchronously into `Monitor` (e.g., Claude Code) or via long-timeout shell commands in other agents.
+- **Traffic-aware stall detection &amp; retries.** Silence triggers a warning, then a same-session retry with backoff. On macOS, the supervisor checks network traffic via `nettop` so long silent generation is never mistaken for a hang.
+- **Exit-code-7 two-way intercom.** When the worker hits an ambiguity not covered by the brief, it pauses with exit code `7` and raises a question. The lead replies with `answer` (or asks you first), and can also send mid-run course corrections via `note`.
+- **5-slot brief template.** Goal, real usage scenario, developer intent, project intent, and acceptance criteria are required slots so execution never drifts from why the task exists.
+- **Gated acceptance &amp; decision confession list.** Rejects a bare "done". Every turn reports changed files, artifacts, self-checks, and **every decision the worker (or its sub-agents) made on its own** for line-by-line review.
+- **Parallel work &amp; timeout-proof watching.** Includes git worktree/branch parallel guidance; the supervisor runs detached from the watcher, so a 29-minute watch timeout (exit code `8`) never kills the worker — just re-attach with `watch`.
+- **Persistent config &amp; live overrides.** Supports `~/.claude/agent-foreman/config.json` for default agent/model/effort/timeouts/retries, plus `MATOU_FOREMAN_ROLES_FILE` for per-agent roles, model/speed presets, and the sub-dispatch toggle.
+
+## Optional Bonus with Matou Workbench
+
+Agent Foreman is completely standalone and works in any terminal. When used inside the native [Matou](https://github.com/icesword0760/matou) terminal workbench:
+
+- **Zero-setup across all built-in agents:** `mt-foreman` (equivalent to `node <skill-dir>/scripts/foreman.mjs`) is automatically available to Claude Code, Codex, DSH, and Antigravity sessions.
+- **Bottom-bar HUD:** Every dispatched task projects live into Matou's bottom `Agents` pill and hover card showing agent, task name, model, effort/speed tier, current step, and elapsed time.
+- **Visual Dispatch Settings:** Tweak global defaults, per-agent niches, independent model/effort/speed presets, and the sub-dispatch toggle in **Settings → Dispatch** with instant effect.
 
 ## Requirements
 
-- Claude Code with the Monitor tool
-- [Codex CLI](https://github.com/openai/codex), logged in
 - Node.js 22 or newer
-- macOS. This is what it is built and tested on. Other systems are untested, and the network-based activity detection is macOS-only.
-- Optional: the `dsh` CLI, for front-end UI sub-tasks
-- Optional: the `agy` (Antigravity) CLI, for tasks you hand to Antigravity
+- At least one logged-in worker CLI (recommended: [Codex CLI](https://github.com/openai/codex))
+- macOS (developed and tested on macOS; `nettop` traffic-based stall detection is macOS-only)
+- Optional: `dsh` CLI (front-end UI dispatch &amp; sub-dispatch)
+- Optional: `agy` (Antigravity) CLI (explicit-mention consultation &amp; review)
+- Any shell/skill-capable lead agent (e.g., [Claude Code](https://claude.com/claude-code), Codex, DSH, Antigravity)
 
 ## Install
 
@@ -48,7 +66,7 @@ As a Claude Code plugin:
 /plugin install agent-foreman@agent-foreman
 ```
 
-Or copy the skill by hand:
+Or copy the skill manually (for Claude Code or other compatible agents):
 
 ```bash
 git clone https://github.com/icesword0760/agent-foreman.git
@@ -57,34 +75,39 @@ cp -R agent-foreman/skills/agent-foreman ~/.claude/skills/
 
 ## Use
 
-Ask Claude to hand something to Codex, for example "让 Codex 把购物车接上后端" or "have Codex add tests for the parser". The skill loads, Claude fills in the brief, starts the task inside Monitor, and handles the events from there.
+Ask your lead agent in plain language — for example:
+- *"Hand the cart pricing engine and tests to Codex, and let it sub-dispatch the drawer UI to DSH."*
+- *"Ask Antigravity to review this architecture plan first."*
+- *"Set Codex default speed to ultrafast."*
 
-To make Claude always route execution work through it, add a line like this to your `CLAUDE.md`:
+To make your lead agent use Agent Foreman by default, add a line to your instruction file (`CLAUDE.md` / `AGENTS.md`):
 
 ```
 When work is handed to Codex or split into sub-tasks for agents, load the agent-foreman skill first and follow it.
 ```
 
-The commands Claude runs, all from `skills/agent-foreman/scripts/foreman.mjs`:
+Commands in `skills/agent-foreman/scripts/foreman.mjs` (or `mt-foreman` inside Matou):
 
 | Command | Purpose |
 |---|---|
-| `start <task> --cd <dir>` | Start a task; the brief comes from stdin |
-| `send <task>` | Continue in the same session (rework, next gate, a user decision) |
-| `watch <task>` | Re-attach to the event stream |
-| `answer <task> [n]` / `note <task>` | Answer a question / leave a note |
+| `start <task> --cd <dir>` | Start a task; brief comes from stdin or `--brief <file>` (`--agent codex\|dsh\|agy`) |
+| `send <task>` | Continue in the same session (rework, next gate, user decision) |
+| `watch <task>` | Re-attach to the live event stream |
+| `answer <task> [n]` / `note <task>` | Answer an exit-code-7 question / leave a mid-run note |
 | `status <task>` / `stop <task>` | Inspect / stop and clean up |
-| `models` | Show how model keywords resolve |
+| `roles` | Inspect active per-agent roles, default models, and sub-dispatch policy |
+| `guide <brief\|parallel\|reference>` | Read the brief template, parallel guide, or full CLI reference |
+| `models` | Show how model keywords currently resolve |
 
-Run records live in `~/.claude/agent-foreman/runs/<task>/`: the briefs, every event, questions and answers, the decision log, and Codex's final replies. See [`reference.md`](skills/agent-foreman/reference.md) for every option, event symbol and exit code.
+Run records live in `~/.claude/agent-foreman/runs/<task>/`: briefs, full event logs, Q&amp;A, decision logs, and final replies. See [`reference.md`](skills/agent-foreman/reference.md) for all flags, event symbols, and exit codes.
 
-## Safety: read this
+## Safety: Read This
 
-By default Codex runs **without a sandbox and without approval prompts** (`danger-full-access`, approval policy `never`), the same way most people run Codex by hand. That is what lets it run `git add`, start dev servers, open browsers and call MCP tools. It also means **the brief is the only thing stopping a paid, external or irreversible action.** The skill tells Claude to list such actions under "must ask first" in every brief, and the supervisor's run rules forbid `git push` and allow commits only when the brief asks for them. Add `--sandbox` to a task that should not touch anything outside its working directory.
+By default Codex runs **without a sandbox and without approval prompts** (`danger-full-access`, approval policy `never`), matching how most people run Codex by hand so it can run `git add`, start dev servers, open browsers, and call MCP tools. That means **the brief is the only guardrail against paid, external, or irreversible actions**: list them under "must ask first" in every brief. The supervisor's run rules forbid `git push` and only allow commits when explicitly requested. Pass `--sandbox` for tasks that must stay strictly inside their working directory.
 
 ## Language
 
-The skill's instructions, the brief template, and the events and rules the supervisor sends are written in Chinese. Claude and Codex both work with them fine, and you can talk to Claude in any language, but the event lines you see will be in Chinese.
+The skill instructions, brief template, supervisor events, and run rules are written in Chinese. Major models handle them cleanly, and you can talk to your lead agent in any language while seeing Chinese event lines.
 
 ## Tests
 
@@ -92,7 +115,7 @@ The skill's instructions, the brief template, and the events and rules the super
 node --test skills/agent-foreman/tests/*.test.mjs
 ```
 
-The tests use fake `codex`, `dsh` and `agy` executables; they need no network or account.
+Tests run against local mock `codex`, `dsh`, and `agy` executables with no network or accounts required.
 
 ## License
 
